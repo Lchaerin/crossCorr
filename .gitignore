@@ -1,0 +1,53 @@
+# =============================================================================
+# SLED — Binaural Sound Localization & Event Detection
+# =============================================================================
+
+# ── Generated datasets ────────────────────────────────────────────────────────
+data/
+data_*/
+sources/
+
+# ── HRTF / audio assets (large binaries — download via download_dataset.sh) ──
+hrtf/*.sofa
+soud_effects/*.mp3
+soud_effects/*.wav
+soud_effects/*/          # class subdirs created by download_dataset.sh
+
+# ── Model outputs & checkpoints ───────────────────────────────────────────────
+output/
+checkpoints/
+checkpoints_*/
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+/tmp/
+.claude/
