@@ -84,6 +84,13 @@ section "Pre-flight"
 need_cmd python3 python3
 need_cmd unzip  unzip
 
+# Check for 7z (needed for FSD50K split-zip extraction)
+if ! command -v 7z &>/dev/null; then
+  warn "7z not found — required for FSD50K split-zip extraction."
+  warn "Install with: sudo apt-get install p7zip-full"
+  warn "(continuing; will abort at extraction step if missing)"
+fi
+
 # Check HRTF
 if [[ -f "${HRTF_DIR}/p0001.sofa" ]]; then
   info "HRTF: ${HRTF_DIR}/p0001.sofa ✓"
@@ -144,20 +151,16 @@ if [[ "$CHECK_ONLY" == false ]]; then
   done
 
   # Extract dev audio (split zip)
-  # Use cat + unzip: most reliable method for split zips on Linux
+  # FSD50K uses Windows-style split zip: central directory offsets are relative
+  # to the last disk, not the combined file — only 7z handles this correctly.
   if [[ ! -d "${FSD50K_DIR}/FSD50K.dev_audio" ]]; then
-    info "Extracting dev audio (split zip via cat) ..."
-    cd "$FSD50K_DIR"
-    # cat all parts in order → pipe to unzip
-    cat FSD50K.dev_audio.z01 \
-        FSD50K.dev_audio.z02 \
-        FSD50K.dev_audio.z03 \
-        FSD50K.dev_audio.z04 \
-        FSD50K.dev_audio.z05 \
-        FSD50K.dev_audio.zip > FSD50K.dev_audio_combined.zip
-    unzip -q FSD50K.dev_audio_combined.zip -d .
-    rm -f FSD50K.dev_audio_combined.zip
-    cd "$SCRIPT_DIR"
+    info "Extracting dev audio (split zip via 7z) ..."
+    if ! command -v 7z &>/dev/null; then
+      err "7z is required but not installed. Run: sudo apt-get install p7zip-full"
+      exit 1
+    fi
+    # Point 7z at the last part (.zip); it auto-locates .z01-.z05 in the same dir
+    7z x "${FSD50K_DIR}/FSD50K.dev_audio.zip" -o"${FSD50K_DIR}" -y
   else
     info "  Dev audio already extracted."
   fi
