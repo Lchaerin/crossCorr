@@ -104,34 +104,57 @@ section "FSD50K  (Freesound Dataset 50K)"
 FSD50K_BASE="https://zenodo.org/records/4060432/files"
 mkdir -p "$FSD50K_DIR"
 
-declare -A FSD50K_FILES=(
-  ["FSD50K.dev_audio.z01"]="${FSD50K_BASE}/FSD50K.dev_audio.z01?download=1"
-  ["FSD50K.dev_audio.z02"]="${FSD50K_BASE}/FSD50K.dev_audio.z02?download=1"
-  ["FSD50K.dev_audio.z03"]="${FSD50K_BASE}/FSD50K.dev_audio.z03?download=1"
-  ["FSD50K.dev_audio.z04"]="${FSD50K_BASE}/FSD50K.dev_audio.z04?download=1"
-  ["FSD50K.dev_audio.zip"]="${FSD50K_BASE}/FSD50K.dev_audio.zip?download=1"
-  ["FSD50K.eval_audio.zip"]="${FSD50K_BASE}/FSD50K.eval_audio.zip?download=1"
-  ["FSD50K.metadata.zip"]="${FSD50K_BASE}/FSD50K.metadata.zip?download=1"
-  ["FSD50K.doc.zip"]="${FSD50K_BASE}/FSD50K.doc.zip?download=1"
+FSD50K_DEV_PARTS=(
+  "FSD50K.dev_audio.z01"
+  "FSD50K.dev_audio.z02"
+  "FSD50K.dev_audio.z03"
+  "FSD50K.dev_audio.z04"
+  "FSD50K.dev_audio.z05"
+  "FSD50K.dev_audio.zip"
+)
+FSD50K_OTHER_FILES=(
+  "FSD50K.eval_audio.zip"
+  "FSD50K.metadata.zip"
+  "FSD50K.doc.zip"
 )
 
 if [[ "$CHECK_ONLY" == false ]]; then
   info "Downloading FSD50K to ${FSD50K_DIR} ..."
-  for fname in "${!FSD50K_FILES[@]}"; do
+
+  # Dev audio parts (.z01–.z05 + .zip)
+  for fname in "${FSD50K_DEV_PARTS[@]}"; do
     dest="${FSD50K_DIR}/${fname}"
     if [[ -f "$dest" ]]; then
       info "  Already exists: ${fname}"
     else
       info "  Downloading: ${fname}"
-      download "${FSD50K_FILES[$fname]}" "$dest"
+      download "${FSD50K_BASE}/${fname}?download=1" "$dest"
+    fi
+  done
+
+  # Other files (eval, metadata, doc)
+  for fname in "${FSD50K_OTHER_FILES[@]}"; do
+    dest="${FSD50K_DIR}/${fname}"
+    if [[ -f "$dest" ]]; then
+      info "  Already exists: ${fname}"
+    else
+      info "  Downloading: ${fname}"
+      download "${FSD50K_BASE}/${fname}?download=1" "$dest"
     fi
   done
 
   # Extract dev audio (split zip)
+  # Use cat + unzip: most reliable method for split zips on Linux
   if [[ ! -d "${FSD50K_DIR}/FSD50K.dev_audio" ]]; then
-    info "Extracting dev audio (split zip) ..."
+    info "Extracting dev audio (split zip via cat) ..."
     cd "$FSD50K_DIR"
-    zip -s 0 FSD50K.dev_audio.zip --out FSD50K.dev_audio_combined.zip
+    # cat all parts in order → pipe to unzip
+    cat FSD50K.dev_audio.z01 \
+        FSD50K.dev_audio.z02 \
+        FSD50K.dev_audio.z03 \
+        FSD50K.dev_audio.z04 \
+        FSD50K.dev_audio.z05 \
+        FSD50K.dev_audio.zip > FSD50K.dev_audio_combined.zip
     unzip -q FSD50K.dev_audio_combined.zip -d .
     rm -f FSD50K.dev_audio_combined.zip
     cd "$SCRIPT_DIR"
