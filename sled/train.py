@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
 
 # Make sled package importable when run as a script from any working directory
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -335,7 +336,8 @@ def compute_losses(layer_preds: list, gt: dict,
 # =============================================================================
 
 def train_one_epoch(model: nn.Module, loader, optimizer: torch.optim.Optimizer,
-                    device: str, epoch: int) -> float:
+                    device: str, epoch: int,
+                    writer: SummaryWriter, global_step: int) -> tuple[float, int]:
     model.train()
     total_loss  = 0.0
     n_batches   = 0
@@ -366,6 +368,8 @@ def train_one_epoch(model: nn.Module, loader, optimizer: torch.optim.Optimizer,
 
         total_loss += loss.item()
         n_batches  += 1
+        global_step += 1
+        writer.add_scalar('Loss/train_step', loss.item(), global_step)
 
         if (batch_idx + 1) % 10 == 0:
             elapsed = time.time() - t0
@@ -373,7 +377,7 @@ def train_one_epoch(model: nn.Module, loader, optimizer: torch.optim.Optimizer,
             print(f'  Epoch {epoch} [{batch_idx+1}/{len(loader)}]  '
                   f'loss={avg:.4f}  ({elapsed:.1f}s)')
 
-    return total_loss / max(n_batches, 1)
+    return total_loss / max(n_batches, 1), global_step
 
 
 @torch.no_grad()
@@ -420,6 +424,8 @@ def main():
     parser.add_argument('--device',         default='cuda' if torch.cuda.is_available()
                                                      else 'cpu')
     parser.add_argument('--checkpoint-dir', default='./checkpoints')
+    parser.add_argument('--log-dir',        default='./runs',
+                        help='TensorBoard log directory')
     parser.add_argument('--resume',         type=str,   default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--window-frames',  type=int,   default=256,
@@ -430,6 +436,8 @@ def main():
 
     device = args.device
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=args.log_dir)
+    print(f'[TB]   TensorBoard log dir: {os.path.abspath(args.log_dir)}')
 
     # ── Model ─────────────────────────────────────────────────────────────────
     sofa_path = os.path.abspath(args.sofa_path)
@@ -486,6 +494,7 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     best_val_loss = float('inf')
+    global_step   = (start_epoch - 1) * len(train_loader)
 
     for epoch in range(start_epoch, args.epochs + 1):
 
@@ -499,15 +508,22 @@ def main():
             model.denoising.n_dn_groups = 3
 
         t_start = time.time()
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
-        val_loss   = validate(model, val_loader, device)
+        train_loss, global_step = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, writer, global_step
+        )
+        val_loss = validate(model, val_loader, device)
         scheduler.step()
 
         elapsed = time.time() - t_start
+        lr = scheduler.get_last_lr()[0]
         print(f'Epoch {epoch:4d}/{args.epochs}  '
               f'train={train_loss:.4f}  val={val_loss:.4f}  '
-              f'lr={scheduler.get_last_lr()[0]:.2e}  '
+              f'lr={lr:.2e}  '
               f'({elapsed:.0f}s)')
+
+        writer.add_scalars('Loss/epoch',
+                           {'train': train_loss, 'val': val_loss}, epoch)
+        writer.add_scalar('LR', lr, epoch)
 
         # Save checkpoint every 10 epochs and when best
         if epoch % 10 == 0 or val_loss < best_val_loss:
@@ -529,6 +545,7 @@ def main():
                 torch.save(ckpt, best_path)
                 print(f'  ** New best: val_loss={best_val_loss:.4f} → {best_path}')
 
+    writer.close()
     print('Training complete.')
 
 

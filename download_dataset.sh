@@ -195,42 +195,42 @@ info "FSD50K: dev=${DEV_COUNT} clips, eval=${EVAL_COUNT} clips"
 
 if [[ "$CHECK_ONLY" == false && ( "$DEV_COUNT" -gt 0 || "$EVAL_COUNT" -gt 0 ) ]]; then
   section "Linking FSD50K clips into soud_effects/"
-  VOCAB="${FSD50K_DIR}/FSD50K.metadata/vocabulary.csv"
-  DEV_GT="${FSD50K_DIR}/FSD50K.metadata/collection/ground_truth/dev.csv"
-  EVAL_GT="${FSD50K_DIR}/FSD50K.metadata/collection/ground_truth/eval.csv"
+  # Actual FSD50K layout: ground_truth is a top-level sibling dir, not under metadata
+  VOCAB="${FSD50K_DIR}/FSD50K.ground_truth/vocabulary.csv"
+  DEV_GT="${FSD50K_DIR}/FSD50K.ground_truth/dev.csv"
+  EVAL_GT="${FSD50K_DIR}/FSD50K.ground_truth/eval.csv"
 
   if [[ -f "$VOCAB" && -f "$DEV_GT" ]]; then
     info "Populating ${SFX_DIR}/ via symlinks ..."
     mkdir -p "$SFX_DIR"
 
     /home/rllab/anaconda3/bin/python3 - <<'PYEOF'
-import csv, os, pathlib, sys
+import csv, os, sys
 
 script_dir = os.environ.get("SCRIPT_DIR", ".")
 fsd50k_dir = os.path.join(script_dir, "sources", "FSD50K")
 sfx_dir    = os.path.join(script_dir, "soud_effects")
 
-vocab_path    = os.path.join(fsd50k_dir, "FSD50K.metadata", "vocabulary.csv")
-dev_gt_path   = os.path.join(fsd50k_dir, "FSD50K.metadata", "collection", "ground_truth", "dev.csv")
-eval_gt_path  = os.path.join(fsd50k_dir, "FSD50K.metadata", "collection", "ground_truth", "eval.csv")
-dev_audio     = os.path.join(fsd50k_dir, "FSD50K.dev_audio")
-eval_audio    = os.path.join(fsd50k_dir, "FSD50K.eval_audio")
+# Actual FSD50K layout: vocabulary.csv in FSD50K.ground_truth/
+# Format: index,label,mid  (no header)
+vocab_path   = os.path.join(fsd50k_dir, "FSD50K.ground_truth", "vocabulary.csv")
+dev_gt_path  = os.path.join(fsd50k_dir, "FSD50K.ground_truth", "dev.csv")
+eval_gt_path = os.path.join(fsd50k_dir, "FSD50K.ground_truth", "eval.csv")
+dev_audio    = os.path.join(fsd50k_dir, "FSD50K.dev_audio")
+eval_audio   = os.path.join(fsd50k_dir, "FSD50K.eval_audio")
 
 if not os.path.exists(vocab_path):
     print(f"  [SKIP] {vocab_path} not found — skipping symlink creation")
     sys.exit(0)
 
-# Build id→label mapping from vocabulary.csv
-# FSD50K vocabulary.csv format: mids,labels  (no "id" column)
+# vocabulary.csv: index,label,mid  (no header row)
 id2label = {}
 with open(vocab_path) as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        # columns: mids, labels
-        mid   = row.get("mids", "").strip()
-        label = row.get("labels", "").strip().replace(" ", "_").replace("/", "-")
-        if mid:
-            id2label[mid] = label
+    for line in f:
+        parts = line.strip().split(",", 2)
+        if len(parts) == 3:
+            _, label, mid = parts
+            id2label[mid.strip()] = label.strip().replace(" ", "_").replace("/", "-")
 
 def link_csv(gt_path, audio_dir):
     if not os.path.exists(gt_path):

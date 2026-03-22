@@ -29,7 +29,7 @@ if _ROOT not in sys.path:
 
 from sled.dataset.synthesizer import (
     SOFA_PATH, SFX_DIR,
-    load_sofa, load_sfx, build_class_map,
+    load_sofa, scan_sfx_paths, load_sfx_from_paths, build_class_map,
     synthesize_scene,
 )
 
@@ -62,10 +62,12 @@ def _generate_synthetic_tones(sfx_dir, fs=48_000, duration=4.0):
 _WORKER_STATE: dict = {}
 
 
-def _worker_init(sofa_path, sfx_dir, class_map):
+def _worker_init(sofa_path, sfx_paths, class_map, max_sfx_files):
     """Called once per worker process to load shared resources."""
     hrir_l, hrir_r, azimuths, elevations, fs_hrtf = load_sofa(sofa_path)
-    sfx = load_sfx(sfx_dir, int(fs_hrtf))
+    # Each worker loads a different random subset of clips (seed = pid).
+    sfx = load_sfx_from_paths(sfx_paths, int(fs_hrtf),
+                               max_files=max_sfx_files, seed=os.getpid())
     _WORKER_STATE['hrir_l']     = hrir_l
     _WORKER_STATE['hrir_r']     = hrir_r
     _WORKER_STATE['azimuths']   = azimuths
@@ -106,16 +108,21 @@ def _synthesize_task(args):
 # Build one split
 # =============================================================================
 
-def _build_split(split, n_scenes, output_dir, workers, seed, resume):
+def _build_split(split, n_scenes, output_dir, workers, seed, resume,
+                 sfx_paths, class_map, max_sfx_files):
     """Build all scenes for one split, using multiprocessing."""
     try:
         from tqdm import tqdm
         _tqdm = tqdm
     except ImportError:
-        def _tqdm(it, **kw):
-            total = kw.get('total', '?')
-            print(f'[{split}] generating {total} scenes ...')
-            return it
+        class _tqdm:
+            def __init__(self, it=None, **kw):
+                self._it = it
+                print(f'[{split}] generating {kw.get("total", "?")} scenes ...')
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def __iter__(self): return iter(self._it)
+            def update(self, n=1): pass
 
     audio_dir = os.path.join(output_dir, 'audio', split)
     anno_dir  = os.path.join(output_dir, 'annotations', split)
@@ -139,17 +146,11 @@ def _build_split(split, n_scenes, output_dir, workers, seed, resume):
         print(f'[{split}] All scenes already exist — skipping.')
         return
 
-    # Prepare shared state for initialiser
-    # Load SOFA + sfx in the main process to get the class_map
-    hrir_l, hrir_r, azimuths, elevations, fs_hrtf = load_sofa(SOFA_PATH)
-    sfx = load_sfx(SFX_DIR, int(fs_hrtf))
-    class_map = build_class_map(sfx)
-
     ctx = mp.get_context('spawn')
     pool = ctx.Pool(
         processes   = max(1, workers),
         initializer = _worker_init,
-        initargs    = (SOFA_PATH, SFX_DIR, class_map),
+        initargs    = (SOFA_PATH, sfx_paths, class_map, max_sfx_files),
     )
 
     errors = []
@@ -185,14 +186,18 @@ def main():
     parser.add_argument('--num-test',  type=int, default=10)
     parser.add_argument('--workers',   type=int, default=4,
                         help='Number of parallel worker processes')
-    parser.add_argument('--seed',      type=int, default=42)
-    parser.add_argument('--resume',    action='store_true',
+    parser.add_argument('--seed',         type=int, default=42)
+    parser.add_argument('--resume',       action='store_true',
                         help='Skip scenes whose WAV already exists')
+    parser.add_argument('--max-sfx-files', type=int, default=500,
+                        help='Max SFX clips loaded per worker (0 = all)')
     args = parser.parse_args()
 
     output_dir = os.path.abspath(args.output_dir)
     meta_dir   = os.path.join(output_dir, 'meta')
     os.makedirs(meta_dir, exist_ok=True)
+
+    max_sfx_files = args.max_sfx_files if args.max_sfx_files > 0 else None
 
     # ── Check / generate SFX ─────────────────────────────────────────────────
     mp3_files = [f for f in os.listdir(SFX_DIR) if f.lower().endswith('.mp3')]
@@ -201,17 +206,19 @@ def main():
         print('[SFX] soud_effects/ directory is empty — generating synthetic tones.')
         _generate_synthetic_tones(SFX_DIR, fs=48_000, duration=4.0)
 
-    # ── Load resources (main process, for meta) ───────────────────────────────
+    # ── Scan HRTF + SFX paths (no audio loaded in main process) ──────────────
     print('[SOFA] Loading HRTF ...')
     hrir_l, hrir_r, azimuths, elevations, fs_hrtf = load_sofa(SOFA_PATH)
     fs = int(fs_hrtf)
     print(f'       {len(azimuths)} directions, fs={fs} Hz')
 
-    print('[SFX]  Loading sound effects ...')
-    sfx = load_sfx(SFX_DIR, fs)
-    print(f'       {len(sfx)} files loaded')
+    print('[SFX]  Scanning sound effects ...')
+    sfx_paths = scan_sfx_paths(SFX_DIR)
+    print(f'       {len(sfx_paths)} clips found'
+          + (f' (workers will load up to {max_sfx_files} each)'
+             if max_sfx_files else ''))
 
-    class_map = build_class_map(sfx)
+    class_map = build_class_map(sfx_paths)
 
     # ── Save meta files ───────────────────────────────────────────────────────
     class_map_path = os.path.join(meta_dir, 'class_map.json')
@@ -249,7 +256,8 @@ def main():
                      ('val',   args.num_val),
                      ('test',  args.num_test)]:
         print(f'\n[BUILD] {split} ({n} scenes) ...')
-        _build_split(split, n, output_dir, args.workers, args.seed, args.resume)
+        _build_split(split, n, output_dir, args.workers, args.seed, args.resume,
+                     sfx_paths, class_map, max_sfx_files)
 
     print('\nDataset build complete.')
 

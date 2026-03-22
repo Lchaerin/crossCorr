@@ -78,39 +78,47 @@ def load_sofa(filepath):
 # 2.  SFX loader
 # =============================================================================
 
-def load_sfx(sfx_dir, target_fs):
-    """Load all .mp3/.wav files from sfx_dir (flat or class-subdirectory layout).
+def scan_sfx_paths(sfx_dir):
+    """Scan sfx_dir and return {key: path} without loading any audio.
 
     Supports two layouts:
       Flat:  sfx_dir/{clip}.wav
       Class: sfx_dir/{class_label}/{clip}.wav  (FSD50K symlink layout)
+    """
+    supported = ('.mp3', '.wav')
+    paths = {}
+    for entry in sorted(os.scandir(sfx_dir), key=lambda e: e.name):
+        if entry.is_dir(follow_symlinks=True):
+            for sub in sorted(os.scandir(entry.path), key=lambda e: e.name):
+                if sub.name.lower().endswith(supported) and sub.is_file(follow_symlinks=True):
+                    paths[f"{entry.name}/{sub.name}"] = sub.path
+        elif entry.is_file(follow_symlinks=True) and entry.name.lower().endswith(supported):
+            paths[entry.name] = entry.path
+    return paths
 
-    Keys in the returned dict are '{class_label}/{clip}' for the class layout
-    and '{clip}' for the flat layout.
+
+def load_sfx_from_paths(sfx_paths, target_fs, max_files=None, seed=None):
+    """Load audio from a pre-scanned {key: path} dict.
+
+    Parameters
+    ----------
+    sfx_paths  : dict  {key: path}  from scan_sfx_paths()
+    target_fs  : int   target sample rate
+    max_files  : int or None  if set, randomly sample this many clips
+    seed       : int or None  RNG seed for the sampling
 
     Returns
     -------
     dict  {key: np.ndarray (mono float32)}
     """
+    entries = list(sfx_paths.items())
+    if max_files is not None and max_files < len(entries):
+        rng = np.random.RandomState(seed)
+        idx = rng.choice(len(entries), max_files, replace=False)
+        entries = [entries[i] for i in sorted(idx)]
+
+    print(f"  [SFX] Loading {len(entries)} / {len(sfx_paths)} clips …")
     sfx = {}
-    supported = ('.mp3', '.wav')
-
-    # Collect (relative_key, absolute_path) pairs
-    entries = []
-    for entry in sorted(os.scandir(sfx_dir), key=lambda e: e.name):
-        if entry.is_dir(follow_symlinks=True):
-            # Class subdirectory
-            for sub in sorted(os.scandir(entry.path), key=lambda e: e.name):
-                if sub.name.lower().endswith(supported) and sub.is_file(follow_symlinks=True):
-                    key = f"{entry.name}/{sub.name}"
-                    entries.append((key, sub.path))
-        elif entry.is_file(follow_symlinks=True) and entry.name.lower().endswith(supported):
-            entries.append((entry.name, entry.path))
-
-    if not entries:
-        return sfx
-
-    print(f"  [SFX] Loading {len(entries)} clips …")
     for key, path in entries:
         try:
             audio, _ = librosa.load(path, sr=target_fs, mono=True)
@@ -118,6 +126,28 @@ def load_sfx(sfx_dir, target_fs):
         except Exception as e:
             print(f"  [SFX] Warning: could not load {key}: {e}")
     return sfx
+
+
+def load_sfx(sfx_dir, target_fs, max_files=None, seed=None):
+    """Scan sfx_dir and load audio clips.
+
+    Supports two layouts:
+      Flat:  sfx_dir/{clip}.wav
+      Class: sfx_dir/{class_label}/{clip}.wav  (FSD50K symlink layout)
+
+    Parameters
+    ----------
+    max_files : int or None  if set, randomly sample this many clips
+    seed      : int or None  RNG seed for sampling
+
+    Returns
+    -------
+    dict  {key: np.ndarray (mono float32)}
+    """
+    paths = scan_sfx_paths(sfx_dir)
+    if not paths:
+        return {}
+    return load_sfx_from_paths(paths, target_fs, max_files=max_files, seed=seed)
 
 
 # =============================================================================
