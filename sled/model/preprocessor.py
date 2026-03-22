@@ -171,6 +171,8 @@ class AudioPreprocessor(nn.Module):
         self.register_buffer('norm_hr_sq',  torch.from_numpy(norm_hr_sq_np))
         self.register_buffer('norm_hl_sq',  torch.from_numpy(norm_hl_sq_np))
         self.register_buffer('az_bin_idx',  torch.from_numpy(az_bin_idx))
+        self.register_buffer('elevations',
+                             torch.from_numpy(source_pos[:, 1].astype(np.float32)))
         self._N_DIR = N_DIR
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -250,38 +252,44 @@ class AudioPreprocessor(nn.Module):
         ch4 = mel_csd_real / mel_csd_norm   # cos(IPD) [B, 64, T]
 
         # ── HRTF cross-correlation heatmap (channel 5) ────────────────────────
+        # Computed ONCE per window using the time-averaged CSD spectrum.
+        # Output: [B, az_bins=64, el_bins=T_stft]  — az × el 2D spatial map.
         T_stft = X_L.shape[-1]
 
-        # CSD = X_L * conj(X_R): [B, F, T]   (real and imag parts)
-        csd_r = csd_full.real   # [B, F, T]
-        csd_i = csd_full.imag
+        # Sample 8 evenly spaced frames across the window and average → [B, F]
+        T_stft   = csd_full.shape[-1]
+        idx8     = torch.linspace(0, T_stft - 1, 8).long()
+        csd_r_avg = csd_full.real[..., idx8].mean(dim=-1)
+        csd_i_avg = csd_full.imag[..., idx8].mean(dim=-1)
 
-        # W_real, W_imag: [N_DIR, F]
-        # corr_unnorm[B, N_DIR, T] = W_real @ csd_r - W_imag @ csd_i
-        # Use einsum: 'df,bft->bdt'
+        # Per-direction correlation  [B, N_DIR]
         corr_unnorm = (
-            torch.einsum('df,bft->bdt', self.W_real, csd_r) -
-            torch.einsum('df,bft->bdt', self.W_imag, csd_i)
-        )  # [B, N_DIR, T]
+            torch.einsum('df,bf->bd', self.W_real, csd_r_avg) -
+            torch.einsum('df,bf->bd', self.W_imag, csd_i_avg)
+        )
+        norm1_sq = torch.einsum('df,bf->bd', self.norm_hr_sq, pow_L[..., idx8].mean(dim=-1))
+        norm2_sq = torch.einsum('df,bf->bd', self.norm_hl_sq, pow_R[..., idx8].mean(dim=-1))
+        corr = corr_unnorm / (norm1_sq * norm2_sq + 1e-8).sqrt()   # [B, N_DIR]
 
-        # norm_hr_sq @ |X_L|^2  → [B, N_DIR, T]
-        norm1_sq = torch.einsum('df,bft->bdt', self.norm_hr_sq, pow_L)
-        norm2_sq = torch.einsum('df,bft->bdt', self.norm_hl_sq, pow_R)
-        corr = corr_unnorm / (norm1_sq * norm2_sq + 1e-8).sqrt()  # [B, N_DIR, T]
+        # Build 2D az × el grid  [B, az_bins=64, el_bins=T_stft]
+        # azimuth: 64 bins covering 0°~360° (5.625° per bin)  ← larger dim
+        # elevation: T_stft bins covering -90°~+90° (adaptive resolution)  ← smaller dim
+        az_bins = self.n_mels    # 64
+        el_bins = T_stft
 
-        # Pool N_DIR → 64 azimuth bins via scatter mean
-        # az_bin_idx: [N_DIR]
-        n_bins = self.n_mels   # 64
-        idx    = self.az_bin_idx.view(1, -1, 1).expand(B, -1, T_stft)  # [B,N_DIR,T]
-        hrtf_ch = torch.zeros(B, n_bins, T_stft,
-                              dtype=corr.dtype, device=corr.device)
-        count   = torch.zeros(B, n_bins, T_stft,
-                              dtype=corr.dtype, device=corr.device)
-        hrtf_ch.scatter_add_(1, idx, corr)
-        count.scatter_add_(1, idx,
-                           torch.ones_like(corr))
-        hrtf_ch = hrtf_ch / (count + 1e-8)   # [B, 64, T]
-        ch5 = hrtf_ch
+        el_bin_float = (self.elevations + 90.0) / 180.0 * el_bins  # [N_DIR]
+        el_bin_idx   = el_bin_float.long().clamp(0, el_bins - 1)   # [N_DIR]
+
+        flat_idx   = self.az_bin_idx * el_bins + el_bin_idx         # [N_DIR]
+        flat_idx_b = flat_idx.view(1, -1).expand(B, -1)             # [B, N_DIR]
+
+        hrtf_flat  = corr.new_zeros(B, az_bins * el_bins)
+        count_flat = corr.new_zeros(B, az_bins * el_bins)
+        hrtf_flat.scatter_add_(1, flat_idx_b, corr)
+        count_flat.scatter_add_(1, flat_idx_b, torch.ones_like(corr))
+
+        ch5 = (hrtf_flat / (count_flat + 1e-8)).view(B, az_bins, el_bins)
+        # [B, 64, T_stft]
 
         # ── Stack all 6 channels ─────────────────────────────────────────────
         # Each channel is [B, 64, T]
