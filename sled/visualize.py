@@ -66,7 +66,10 @@ def doa_to_az_el(doa: np.ndarray):
 
 
 def build_id_to_label(class_map_path: str | None) -> dict:
-    """Build {class_id: label_str} from class_map.json."""
+    """Build {class_id: label_str} from class_map.json.
+
+    The empty/background class (max_id + 1) is automatically added as '(empty)'.
+    """
     if not class_map_path or not os.path.exists(class_map_path):
         return {}
     with open(class_map_path) as f:
@@ -77,6 +80,9 @@ def build_id_to_label(class_map_path: str | None) -> dict:
         label = parts[0] if len(parts) == 2 else os.path.splitext(parts[0])[0]
         if cid not in id_to_label:
             id_to_label[cid] = label
+    # Empty/background class sits at max_id + 1
+    if id_to_label:
+        id_to_label[max(id_to_label) + 1] = '(empty)'
     return id_to_label
 
 
@@ -207,22 +213,21 @@ def render_frame(t: int, n_frames: int, sr: int,
         ax_polar.text(az_rad, r + 0.06, ev['label'][:12],
                       color=color, fontsize=6.5, ha='center', va='bottom')
 
-    # Predictions
+    # Predictions (always shown; dimmed when below conf_thresh)
     for s_idx in range(cls_arr.shape[1]):
-        conf = conf_arr[t, s_idx]
-        if conf < conf_thresh:
-            continue
+        conf   = conf_arr[t, s_idx]
         az, el = doa_to_az_el(doa_arr[t, s_idx])
         az_rad = np.radians(az)
         r      = np.cos(np.radians(el))
         color  = _SLOT_COLORS[s_idx % len(_SLOT_COLORS)]
         cls_id = int(cls_arr[t, s_idx])
         label  = id_to_label.get(cls_id, f'cls{cls_id}')
+        alpha  = 0.95 if conf >= conf_thresh else max(0.25, conf)
         ax_polar.scatter(az_rad, r, s=220, c=[color], marker='*',
-                         edgecolors='white', linewidths=0.5, zorder=6, alpha=0.95)
+                         edgecolors='white', linewidths=0.5, zorder=6, alpha=alpha)
         ax_polar.text(az_rad, r - 0.12,
                       f'{label[:12]}\n{conf:.2f}',
-                      color=color, fontsize=6, ha='center', va='top')
+                      color=color, fontsize=6, ha='center', va='top', alpha=alpha)
 
     legend_elems = [
         mpatches.Patch(color='#aaaaaa', label='●  Ground truth'),
@@ -245,17 +250,16 @@ def render_frame(t: int, n_frames: int, sr: int,
     y = 0.97
     _text(y, 'PREDICTIONS', '#ffffff', bold=True, size=9); y -= 0.07
     for s_idx in range(cls_arr.shape[1]):
-        conf  = conf_arr[t, s_idx]
-        color = _SLOT_COLORS[s_idx % len(_SLOT_COLORS)]
-        if conf >= conf_thresh:
-            az, el = doa_to_az_el(doa_arr[t, s_idx])
-            cls_id = int(cls_arr[t, s_idx])
-            label  = id_to_label.get(cls_id, f'cls{cls_id}')
-            _text(y, f'Slot {s_idx+1}  {label[:16]}', color); y -= 0.055
-            _text(y, f'  az={az:6.1f}°  el={el:+5.1f}°  p={conf:.2f}',
-                  color); y -= 0.055
-        else:
-            _text(y, f'Slot {s_idx+1}  (inactive)', '#555555'); y -= 0.055
+        conf   = conf_arr[t, s_idx]
+        color  = _SLOT_COLORS[s_idx % len(_SLOT_COLORS)]
+        az, el = doa_to_az_el(doa_arr[t, s_idx])
+        cls_id = int(cls_arr[t, s_idx])
+        label  = id_to_label.get(cls_id, f'cls{cls_id}')
+        # Dim text colour when below threshold
+        text_color = color if conf >= conf_thresh else '#777777'
+        _text(y, f'Slot {s_idx+1}  {label[:16]}', text_color); y -= 0.055
+        _text(y, f'  az={az:6.1f}°  el={el:+5.1f}°  p={conf:.2f}',
+              text_color); y -= 0.055
 
     if gt_events:
         y -= 0.02

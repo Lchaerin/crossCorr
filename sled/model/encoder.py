@@ -2,14 +2,15 @@
 """
 SLED v3 — Encoder
 ==================
-Input:  [B, 6, 64, T]   6-channel feature tensor from AudioPreprocessor
+Input:  [B, 5, 64, T]   5-channel feature tensor from AudioPreprocessor
+        hrtf_ch [B, 64, T]   HRTF az×el heatmap (channel 5, separate branch)
 Output: (multi_scale_feats, enc_out)
   multi_scale_feats : list of [B, T, 256] tensors (7 candidates total)
   enc_out           : [B, T, 256]
 
 Architecture
 ------------
-  ConvBlock(6→64,   freq_stride=2)  → P3 [B, 64, 32, T]
+  ConvBlock(5→64,   freq_stride=2)  → P3 [B, 64, 32, T]
   ConvBlock(64→128, freq_stride=2)  → P4 [B,128, 16, T]
   ConvBlock(128→256,freq_stride=2)  → P5 [B,256,  8, T]
   SEBlock(256) on P5
@@ -315,6 +316,31 @@ class CausalBiFPN(nn.Module):
 
 
 # =============================================================================
+# HRTF Projection
+# =============================================================================
+
+class HRTFProjection(nn.Module):
+    """Projects the HRTF az×el heatmap [B, az_bins, T] → [B, T, d_model].
+
+    Treats azimuth bins as channels and collapses them via Conv1d.
+    The elevation dimension (T_stft) aligns with the temporal axis of enc_out.
+    """
+
+    def __init__(self, az_bins: int = 64, d_model: int = 256):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv1d(az_bins, d_model, kernel_size=1, bias=False),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+        )
+
+    def forward(self, ch5: torch.Tensor) -> torch.Tensor:
+        # ch5: [B, 64_az, T]
+        x = self.proj(ch5)          # [B, d_model, T]
+        return x.permute(0, 2, 1)   # [B, T, d_model]
+
+
+# =============================================================================
 # SLED Encoder
 # =============================================================================
 
@@ -323,13 +349,13 @@ class SLEDEncoder(nn.Module):
 
     Parameters
     ----------
-    in_channels     : number of input feature channels (6)
+    in_channels     : number of input feature channels (5, excluding ch5 HRTF)
     d_model         : feature dimension for BiFPN + Conformer (256)
     n_bifpn         : number of BiFPN iterations (2)
     n_conformer     : number of CausalConformerBlock layers (4)
     """
 
-    def __init__(self, in_channels: int = 6, d_model: int = 256,
+    def __init__(self, in_channels: int = 5, d_model: int = 256,
                  n_bifpn: int = 2, n_conformer: int = 4):
         super().__init__()
 
@@ -363,15 +389,20 @@ class SLEDEncoder(nn.Module):
             CausalConformerBlock(d_model) for _ in range(n_conformer)
         ])
 
+        # ── HRTF projection (separate branch for ch5) ────────────────────────
+        self.hrtf_proj = HRTFProjection(az_bins=64, d_model=d_model)
+
         self.d_model = d_model
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def forward(self, feat: torch.Tensor):
+    def forward(self, feat: torch.Tensor,
+                hrtf_ch: torch.Tensor | None = None):
         """
         Parameters
         ----------
-        feat : [B, 6, 64, T]
+        feat    : [B, 5, 64, T]
+        hrtf_ch : [B, 64, T]  HRTF az×el heatmap, or None (precomputed mode)
 
         Returns
         -------
@@ -418,6 +449,14 @@ class SLEDEncoder(nn.Module):
 
         for conformer in self.conformers:
             x = conformer(x)
+
+        # ── HRTF residual fusion ──────────────────────────────────────────────
+        if hrtf_ch is not None:
+            # Align T in case of minor length mismatch
+            T_enc = x.shape[1]
+            hrtf_feat = self.hrtf_proj(hrtf_ch)         # [B, T_hrtf, d]
+            hrtf_feat = hrtf_feat[:, :T_enc, :]          # trim to enc T
+            x = x + hrtf_feat
 
         enc_out = x   # [B, T, 256]
 

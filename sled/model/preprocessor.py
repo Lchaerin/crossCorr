@@ -291,7 +291,7 @@ class AudioPreprocessor(nn.Module):
         ch5 = (hrtf_flat / (count_flat + 1e-8)).view(B, az_bins, el_bins)
         # [B, 64, T_stft]
 
-        # ── Stack all 6 channels ─────────────────────────────────────────────
-        # Each channel is [B, 64, T]
-        out = torch.stack([ch0, ch1, ch2, ch3, ch4, ch5], dim=1)  # [B, 6, 64, T]
-        return out
+        # ── Stack channels 0-4; return ch5 separately ───────────────────────
+        # ch0-4 each [B, 64, T]; ch5 [B, 64_az, T_stft]
+        out = torch.stack([ch0, ch1, ch2, ch3, ch4], dim=1)  # [B, 5, 64, T]
+        return out, ch5   # ch5: [B, 64, T_stft]

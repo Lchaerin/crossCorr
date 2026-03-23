@@ -56,7 +56,7 @@ class SLEDv3(nn.Module):
 
         self.preprocessor = AudioPreprocessor(sofa_path)
         self.encoder      = SLEDEncoder(
-            in_channels  = 6,
+            in_channels  = 5,
             d_model      = d_model,
             n_conformer  = n_conformer_layers,
         )
@@ -107,7 +107,7 @@ class SLEDv3(nn.Module):
         """
         Parameters
         ----------
-        audio_or_feat : [B, 2, N] stereo waveform  OR  [B, 6, 64, T] features
+        audio_or_feat : [B, 2, N] stereo waveform  OR  [B, 5, 64, T] features
         gt            : optional dict (training only) with keys:
                           'cls'  [B, T, 5] int64
                           'doa'  [B, T, 5, 3] float32
@@ -126,14 +126,16 @@ class SLEDv3(nn.Module):
         """
         # ── Feature extraction ────────────────────────────────────────────────
         if audio_or_feat.dim() == 3 and not self.precompute_features:
-            feat = self.preprocessor(audio_or_feat)   # [B, 6, 64, T]
+            feat, hrtf_ch = self.preprocessor(audio_or_feat)
+            # feat: [B, 5, 64, T]   hrtf_ch: [B, 64, T_stft]
         else:
-            feat = audio_or_feat                       # [B, 6, 64, T]
+            feat    = audio_or_feat   # [B, 5, 64, T]  (pre-computed)
+            hrtf_ch = None
 
         B, C, F_mel, T = feat.shape
 
         # ── Encoder ──────────────────────────────────────────────────────────
-        multi_scale, enc_out = self.encoder(feat)
+        multi_scale, enc_out = self.encoder(feat, hrtf_ch)
         # multi_scale : list of 7 × [B, T, d]
         # enc_out     : [B, T, d]
 
