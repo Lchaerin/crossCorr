@@ -6,10 +6,10 @@ Maps per-slot features → class logits, DOA unit-vector, loudness, confidence.
 
 Input  : [B, T, S, d_model]  (or any shape where last dim = d_model)
 Output : dict
-    class_logits : [B, T, S, n_classes]   (n_classes = n_real + 1 empty class)
+    class_logits : [B, T, S, n_classes]   real sound classes only (no empty)
     doa_vec      : [B, T, S, 3]           unit vector
     loudness     : [B, T, S]              scalar (dB)
-    confidence   : [B, T, S]             scalar (logit for "this slot is active")
+    confidence   : [B, T, S]             scalar logit for slot presence (active/inactive)
 """
 
 import torch
@@ -27,14 +27,14 @@ class DetectionHeads(nn.Module):
     n_slots   : maximum simultaneous sources per frame
     """
 
-    def __init__(self, d_model: int = 256, n_classes: int = 301,
+    def __init__(self, d_model: int = 256, n_classes: int = 209,
                  n_slots: int = 3):
         super().__init__()
         self.d_model   = d_model
         self.n_classes = n_classes
         self.n_slots   = n_slots
 
-        # Classification head: one logit per class
+        # Classification head: real sound classes only (no empty class)
         self.class_head = nn.Linear(d_model, n_classes)
 
         # DOA head: 256 → 256 → 3, then L2-normalised

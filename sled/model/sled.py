@@ -36,7 +36,7 @@ class SLEDv3(nn.Module):
     sofa_path           : path to SOFA HRTF file
     d_model             : feature dimension (256)
     n_slots             : maximum simultaneous sources per frame (3)
-    n_classes           : total classes including empty (301: 300 real + 1 empty)
+    n_classes           : real sound classes only, no empty class (e.g. 209)
     n_decoder_layers    : number of Look-Forward-Twice decoder layers (4)
     n_conformer_layers  : number of CausalConformerBlocks in encoder (4)
     precompute_features : if True, skip preprocessor in forward (input is [B,6,64,T])
@@ -65,10 +65,10 @@ class SLEDv3(nn.Module):
             n_slots      = n_slots,
             n_candidates = self.N_CANDIDATES,
         )
-        # 300 real classes — ContrastiveDeNoising uses n_classes-1
+        # n_classes = real sound classes only (no empty); DN uses the same space
         self.denoising = ContrastiveDeNoising(
             d_model     = d_model,
-            n_classes   = n_classes - 1,
+            n_classes   = n_classes,
             n_dn_groups = 3,
         )
         self.decoder = LookForwardTwiceDecoder(

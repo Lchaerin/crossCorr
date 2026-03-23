@@ -317,7 +317,7 @@ def main():
     parser.add_argument('--conf-thresh',    type=float, default=0.35)
     parser.add_argument('--window-frames',  type=int,   default=64)
     parser.add_argument('--d-model',        type=int,   default=256)
-    parser.add_argument('--n-classes',      type=int,   default=210)
+    parser.add_argument('--n-classes',      type=int,   default=209)
     parser.add_argument('--sofa-path',      default='./hrtf/p0001.sofa')
     parser.add_argument('--device',
                         default='cuda' if torch.cuda.is_available() else 'cpu')

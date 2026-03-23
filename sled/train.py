@@ -143,22 +143,25 @@ def hungarian_match(pred_logits: torch.Tensor,
 # Loss computation
 # =============================================================================
 
-def _compute_single_layer_loss(pred: dict, gt: dict,
-                                empty_class_id: int) -> torch.Tensor:
+def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
     """Compute matching loss for one decoder layer output.
+
+    Presence (conf_head) and classification (class_head) are treated separately:
+      - Presence loss  : BCE on all slots (1 = matched active, 0 = unmatched/inactive)
+      - Class loss     : focal loss only on matched active slots (no empty class)
+      - DOA loss       : cosine distance on matched active slots
+      - Count loss     : L1 between sum of sigmoid(conf) and GT active count
 
     Parameters
     ----------
-    pred           : dict with class_logits, doa_vec, loudness, confidence
-                     each [B, T, S, *]
-    gt             : dict with cls, doa, loud, mask  [B, T, S, *]
-    empty_class_id : index of the "empty" class
+    pred : dict with class_logits [B,T,S,C], doa_vec [B,T,S,3], confidence [B,T,S]
+    gt   : dict with cls [B,T,S] int64, doa [B,T,S,3], mask [B,T,S] bool
 
     Returns
     -------
     scalar loss
     """
-    class_logits = pred['class_logits']   # [B, T, S, C]
+    class_logits = pred['class_logits']   # [B, T, S, C]  — real classes only
     doa_vec      = pred['doa_vec']        # [B, T, S, 3]
     confidence   = pred['confidence']     # [B, T, S]
 
@@ -178,9 +181,10 @@ def _compute_single_layer_loss(pred: dict, gt: dict,
         gt_doa  = gt_doa[:, :T]
         gt_mask = gt_mask[:, :T]
 
-    total_cls_loss  = torch.tensor(0.0, device=class_logits.device)
-    total_doa_loss  = torch.tensor(0.0, device=class_logits.device)
-    total_conf_loss = torch.tensor(0.0, device=class_logits.device)
+    total_cls_loss   = torch.tensor(0.0, device=class_logits.device)
+    total_doa_loss   = torch.tensor(0.0, device=class_logits.device)
+    total_conf_loss  = torch.tensor(0.0, device=class_logits.device)
+    total_count_loss = torch.tensor(0.0, device=class_logits.device)
     count = 0
 
     for b in range(B):
@@ -192,15 +196,15 @@ def _compute_single_layer_loss(pred: dict, gt: dict,
             doa_gt_bt = gt_doa[b, t]          # [S, 3]
             mask_bt   = gt_mask[b, t]         # [S] bool
 
+            # Count loss: predicted sum of presences vs GT active count
+            pred_count = torch.sigmoid(conf_bt).sum()
+            gt_count   = mask_bt.float().sum()
+            total_count_loss = total_count_loss + F.l1_loss(pred_count, gt_count)
+
             if not mask_bt.any():
-                # No active sources: all predictions should be empty class
-                empty_tgt = torch.full((S,), empty_class_id,
-                                       dtype=torch.long,
-                                       device=logits_bt.device)
-                total_cls_loss  = total_cls_loss  + focal_loss(logits_bt, empty_tgt)
+                # No active sources: all slots inactive
                 total_conf_loss = total_conf_loss + F.binary_cross_entropy_with_logits(
-                    conf_bt,
-                    torch.zeros_like(conf_bt),
+                    conf_bt, torch.zeros_like(conf_bt),
                 )
                 count += 1
                 continue
@@ -211,24 +215,20 @@ def _compute_single_layer_loss(pred: dict, gt: dict,
             )
 
             if not pred_idx:
+                count += 1
                 continue
 
-            # Build target class tensor: empty for unmatched, GT class for matched
-            tgt_cls = torch.full((S,), empty_class_id,
-                                  dtype=torch.long, device=logits_bt.device)
-            tgt_cls_list = active_idx[gt_idx]   # global active indices
-            for pi, ci in zip(pred_idx, range(len(gt_idx))):
-                tgt_cls[pi] = cls_gt_bt[active_idx[gt_idx[ci]]]
+            # Classification loss: only matched slots vs their GT class
+            matched_logits = logits_bt[pred_idx]               # [M, C]
+            matched_cls_gt = cls_gt_bt[active_idx[gt_idx]]     # [M]
+            total_cls_loss = total_cls_loss + focal_loss(matched_logits, matched_cls_gt)
 
-            total_cls_loss = total_cls_loss + focal_loss(logits_bt, tgt_cls)
+            # DOA loss: matched slots only
+            p_doa = doa_bt[pred_idx]
+            g_doa = doa_gt_bt[active_idx[gt_idx]]
+            total_doa_loss = total_doa_loss + cosine_dist_loss(p_doa, g_doa)
 
-            # DOA loss only on matched active slots
-            if pred_idx:
-                p_doa = doa_bt[pred_idx]                     # [M_matched, 3]
-                g_doa = doa_gt_bt[active_idx[gt_idx]]        # [M_matched, 3]
-                total_doa_loss = total_doa_loss + cosine_dist_loss(p_doa, g_doa)
-
-            # Confidence: 1 for matched, 0 for unmatched
+            # Presence loss: 1 for matched, 0 for unmatched
             conf_tgt = torch.zeros(S, device=conf_bt.device)
             for pi in pred_idx:
                 conf_tgt[pi] = 1.0
@@ -241,7 +241,11 @@ def _compute_single_layer_loss(pred: dict, gt: dict,
     if count == 0:
         return torch.tensor(0.0, device=class_logits.device, requires_grad=True)
 
-    return (total_cls_loss + total_doa_loss + total_conf_loss) / count
+    n_det = count
+    n_all = B * T
+    det_loss   = (total_cls_loss + total_doa_loss + total_conf_loss) / n_det
+    count_loss = total_count_loss / n_all
+    return det_loss + 0.5 * count_loss
 
 
 def compute_losses(layer_preds: list, gt: dict,
@@ -272,13 +276,11 @@ def compute_losses(layer_preds: list, gt: dict,
     else:
         weights = base_weights + [1.0] * (n_layers - len(base_weights))
 
-    empty_class_id = layer_preds[0]['class_logits'].shape[-1] - 1
-
     total_loss = torch.tensor(0.0,
                                device=layer_preds[0]['class_logits'].device)
 
     for i, (w, pred) in enumerate(zip(weights, layer_preds)):
-        match_loss = _compute_single_layer_loss(pred, gt, empty_class_id)
+        match_loss = _compute_single_layer_loss(pred, gt)
         total_loss = total_loss + w * match_loss
 
         # DN loss (positive pairs only — DN targets are aligned by construction)
@@ -304,7 +306,9 @@ def compute_losses(layer_preds: list, gt: dict,
             pos_cls_bt = pos_cls_bt.reshape(B, T_frames, G * S_sl)
             pos_doa_bt = pos_doa_bt.reshape(B, T_frames, G * S_sl, 3)
 
-            pos_mask = pos_cls_bt >= 0   # [B, T, G*S_sl]
+            # Active DN slots: class id in valid range [0, C)
+            # Inactive slots have class = n_classes (= C), used as padding in DN
+            pos_mask = pos_cls_bt < C   # [B, T, G*S_sl]
 
             # Only compute DN loss on positive slots (first half of S_dn)
             n_pos = G * S_sl
@@ -324,8 +328,7 @@ def compute_losses(layer_preds: list, gt: dict,
                 'loudness'    : torch.zeros_like(dn_pos_conf),
                 'confidence'  : dn_pos_conf,
             }
-            dn_loss = _compute_single_layer_loss(dn_pred_pos, dn_gt,
-                                                  empty_class_id)
+            dn_loss = _compute_single_layer_loss(dn_pred_pos, dn_gt)
             total_loss = total_loss + w * 0.5 * dn_loss   # half-weight for DN
 
     return total_loss
@@ -431,7 +434,7 @@ def main():
     parser.add_argument('--window-frames',  type=int,   default=256,
                         help='Frames per training window (256 × 20ms = 5.12s)')
     parser.add_argument('--d-model',        type=int,   default=256)
-    parser.add_argument('--n-classes',      type=int,   default=301)
+    parser.add_argument('--n-classes',      type=int,   default=209)
     args = parser.parse_args()
 
     device = args.device
