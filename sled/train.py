@@ -89,88 +89,34 @@ def cosine_dist_loss(pred_doa: torch.Tensor,
 
 
 # =============================================================================
-# Hungarian matching
-# =============================================================================
-
-def hungarian_match(pred_logits: torch.Tensor,
-                    pred_doa: torch.Tensor,
-                    gt_cls: torch.Tensor,
-                    gt_doa: torch.Tensor,
-                    gt_mask: torch.Tensor):
-    """Per-sample Hungarian matching between predictions and GT.
-
-    Matching cost = class cost + doa cost.
-
-    Parameters
-    ----------
-    pred_logits : [N_pred, n_classes]
-    pred_doa    : [N_pred, 3]
-    gt_cls      : [N_gt]   int64
-    gt_doa      : [N_gt, 3]
-    gt_mask     : [N_gt]   bool  — only match against active GT entries
-
-    Returns
-    -------
-    pred_indices : list[int]   matched prediction row indices
-    gt_indices   : list[int]   matched GT row indices (within active set)
-    active_idx   : LongTensor  indices of active GT entries in original [N_gt]
-    """
-    active_idx = gt_mask.nonzero(as_tuple=False).squeeze(1)
-    if active_idx.numel() == 0:
-        return [], [], active_idx
-
-    gt_cls_a  = gt_cls[active_idx]    # [M]
-    gt_doa_a  = gt_doa[active_idx]    # [M, 3]
-    N, M      = pred_logits.shape[0], gt_cls_a.shape[0]
-
-    with torch.no_grad():
-        # Class cost: negative softmax probability for GT class
-        prob      = pred_logits.softmax(-1)           # [N, C]
-        cls_cost  = -prob[:, gt_cls_a]                # [N, M]
-
-        # DOA cost: 1 − cos_sim between each pred and each GT
-        p_norm = F.normalize(pred_doa, dim=-1)        # [N, 3]
-        g_norm = F.normalize(gt_doa_a, dim=-1)        # [M, 3]
-        doa_cost = 1.0 - p_norm @ g_norm.T            # [N, M]
-
-        cost = (cls_cost + doa_cost).cpu().numpy()
-
-    row_ind, col_ind = linear_sum_assignment(cost)
-    return row_ind.tolist(), col_ind.tolist(), active_idx
-
-
-# =============================================================================
 # Loss computation
 # =============================================================================
 
 def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
     """Compute matching loss for one decoder layer output.
 
-    Presence (conf_head) and classification (class_head) are treated separately:
-      - Presence loss  : BCE on all slots (1 = matched active, 0 = unmatched/inactive)
-      - Class loss     : focal loss only on matched active slots (no empty class)
-      - DOA loss       : cosine distance on matched active slots
-      - Count loss     : L1 between sum of sigmoid(conf) and GT active count
+    Vectorised implementation — eliminates the B×T GPU↔CPU sync loop:
+      1. All cost matrices computed on GPU in a single batched operation.
+      2. ONE GPU→CPU transfer for all [BT, S, S] cost matrices.
+      3. scipy Hungarian runs in a tight CPU-only loop (no GPU ops inside).
+      4. Matched indices uploaded to GPU once; all losses computed in batch.
 
-    Parameters
-    ----------
-    pred : dict with class_logits [B,T,S,C], doa_vec [B,T,S,3], confidence [B,T,S]
-    gt   : dict with cls [B,T,S] int64, doa [B,T,S,3], mask [B,T,S] bool
-
-    Returns
-    -------
-    scalar loss
+    Losses
+    ------
+      - Class loss     : focal loss on matched (pred, GT-class) pairs only
+      - DOA loss       : cosine distance on matched pairs
+      - Presence loss  : BCE on all slots (1 = matched, 0 = unmatched/inactive)
+      - Count loss     : L1 between Σ sigmoid(conf) and GT active count
     """
-    class_logits = pred['class_logits']   # [B, T, S, C]  — real classes only
+    class_logits = pred['class_logits']   # [B, T, S, C]
     doa_vec      = pred['doa_vec']        # [B, T, S, 3]
     confidence   = pred['confidence']     # [B, T, S]
 
-    gt_cls  = gt['cls']                   # [B, T, S]   int64
-    gt_doa  = gt['doa']                   # [B, T, S, 3]
-    gt_mask = gt['mask']                  # [B, T, S]   bool
+    gt_cls  = gt['cls']    # [B, T, S]   int64
+    gt_doa  = gt['doa']    # [B, T, S, 3]
+    gt_mask = gt['mask']   # [B, T, S]   bool
 
     B, T, S, C = class_logits.shape
-    # Align T: STFT may produce 1 extra frame vs annotations
     T_gt = gt_cls.shape[1]
     if T != T_gt:
         T = min(T, T_gt)
@@ -181,71 +127,90 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
         gt_doa  = gt_doa[:, :T]
         gt_mask = gt_mask[:, :T]
 
-    total_cls_loss   = torch.tensor(0.0, device=class_logits.device)
-    total_doa_loss   = torch.tensor(0.0, device=class_logits.device)
-    total_conf_loss  = torch.tensor(0.0, device=class_logits.device)
-    total_count_loss = torch.tensor(0.0, device=class_logits.device)
-    count = 0
+    BT     = B * T
+    device = class_logits.device
 
-    for b in range(B):
-        for t in range(T):
-            logits_bt = class_logits[b, t]   # [S, C]
-            doa_bt    = doa_vec[b, t]         # [S, 3]
-            conf_bt   = confidence[b, t]      # [S]
-            cls_gt_bt = gt_cls[b, t]          # [S]
-            doa_gt_bt = gt_doa[b, t]          # [S, 3]
-            mask_bt   = gt_mask[b, t]         # [S] bool
+    # ── Flatten batch × time ──────────────────────────────────────────────────
+    logits_flat = class_logits.reshape(BT, S, C)   # [BT, S, C]
+    doa_flat    = doa_vec.reshape(BT, S, 3)        # [BT, S, 3]
+    conf_flat   = confidence.reshape(BT, S)        # [BT, S]
+    cls_gt_flat = gt_cls.reshape(BT, S)            # [BT, S]
+    doa_gt_flat = gt_doa.reshape(BT, S, 3)         # [BT, S, 3]
+    mask_flat   = gt_mask.reshape(BT, S)           # [BT, S] bool
 
-            # Count loss: predicted sum of presences vs GT active count
-            pred_count = torch.sigmoid(conf_bt).sum()
-            gt_count   = mask_bt.float().sum()
-            total_count_loss = total_count_loss + F.l1_loss(pred_count, gt_count)
+    # ── Count loss (fully vectorised, no loop) ────────────────────────────────
+    count_loss = F.l1_loss(
+        torch.sigmoid(conf_flat).sum(-1),
+        mask_flat.float().sum(-1),
+    )
 
-            if not mask_bt.any():
-                # No active sources: all slots inactive
-                total_conf_loss = total_conf_loss + F.binary_cross_entropy_with_logits(
-                    conf_bt, torch.zeros_like(conf_bt),
-                )
-                count += 1
-                continue
+    # ── Build all [BT, S, S] cost matrices on GPU in one pass ─────────────────
+    # Active GT slots are packed to the front; inactive slots have class = -1.
+    # We clamp to 0 for safe indexing — inactive columns are excluded later
+    # by passing only cost[:, :n_active] to linear_sum_assignment.
+    with torch.no_grad():
+        prob = logits_flat.softmax(-1)                            # [BT, S, C]
 
-            # Hungarian match
-            pred_idx, gt_idx, active_idx = hungarian_match(
-                logits_bt, doa_bt, cls_gt_bt, doa_gt_bt, mask_bt
-            )
+        # cls_cost[bt, i, j] = -prob[bt, i, cls_gt[bt, j]]
+        # Clamp to [0, C-1]: inactive slots carry class=n_classes (=C),
+        # which is out of range for gather. The clamped cost is a dummy —
+        # inactive columns are excluded via active_cols = np.where(mask_np[bt]).
+        cls_gt_exp = cls_gt_flat.clamp(0, C - 1).unsqueeze(1).expand(BT, S, S)
+        cls_cost   = -prob.gather(2, cls_gt_exp)                  # [BT, S, S]
 
-            if not pred_idx:
-                count += 1
-                continue
+        # doa_cost[bt, i, j] = 1 - cos_sim(pred_doa[bt,i], gt_doa[bt,j])
+        pred_norm = F.normalize(doa_flat,    dim=-1)              # [BT, S, 3]
+        gt_norm   = F.normalize(doa_gt_flat, dim=-1)              # [BT, S, 3]
+        doa_cost  = 1.0 - torch.bmm(pred_norm, gt_norm.transpose(1, 2))  # [BT, S, S]
 
-            # Classification loss: only matched slots vs their GT class
-            matched_logits = logits_bt[pred_idx]               # [M, C]
-            matched_cls_gt = cls_gt_bt[active_idx[gt_idx]]     # [M]
-            total_cls_loss = total_cls_loss + focal_loss(matched_logits, matched_cls_gt)
+        # ONE GPU→CPU transfer for all cost matrices + mask
+        cost_np = (cls_cost + doa_cost).cpu().numpy()   # [BT, S, S]
+        mask_np = mask_flat.cpu().numpy()               # [BT, S] bool
 
-            # DOA loss: matched slots only
-            p_doa = doa_bt[pred_idx]
-            g_doa = doa_gt_bt[active_idx[gt_idx]]
-            total_doa_loss = total_doa_loss + cosine_dist_loss(p_doa, g_doa)
+    # ── Hungarian matching — pure CPU, zero GPU ops inside ────────────────────
+    # Use actual active-column indices (not :n_act slice) so that col_arr always
+    # refers to valid GT slots even when active slots are not contiguous.
+    bt_arr  = np.empty(BT * S, dtype=np.int64)
+    row_arr = np.empty(BT * S, dtype=np.int64)
+    col_arr = np.empty(BT * S, dtype=np.int64)
+    n_matched = 0
 
-            # Presence loss: 1 for matched, 0 for unmatched
-            conf_tgt = torch.zeros(S, device=conf_bt.device)
-            for pi in pred_idx:
-                conf_tgt[pi] = 1.0
-            total_conf_loss = total_conf_loss + F.binary_cross_entropy_with_logits(
-                conf_bt, conf_tgt
-            )
+    for bt in range(BT):
+        active_cols = np.where(mask_np[bt])[0]   # actual active GT slot indices
+        if len(active_cols) == 0:
+            continue
+        r, c = linear_sum_assignment(cost_np[bt][:, active_cols])
+        c = active_cols[c]   # remap back to original GT slot positions
+        m = len(r)
+        bt_arr [n_matched:n_matched + m] = bt
+        row_arr[n_matched:n_matched + m] = r
+        col_arr[n_matched:n_matched + m] = c
+        n_matched += m
 
-            count += 1
+    # ── Vectorised loss computation — ONE upload, batch GPU ops ───────────────
+    conf_tgt = torch.zeros(BT, S, device=device)
 
-    if count == 0:
-        return torch.tensor(0.0, device=class_logits.device, requires_grad=True)
+    if n_matched > 0:
+        bt_idx  = torch.from_numpy(bt_arr [:n_matched]).to(device)
+        row_idx = torch.from_numpy(row_arr[:n_matched]).to(device)
+        col_idx = torch.from_numpy(col_arr[:n_matched]).to(device)
 
-    n_det = count
-    n_all = B * T
-    det_loss   = (total_cls_loss + total_doa_loss + total_conf_loss) / n_det
-    count_loss = total_count_loss / n_all
-    return det_loss + 0.5 * count_loss
+        conf_tgt[bt_idx, row_idx] = 1.0
+
+        matched_pred_cls = logits_flat[bt_idx, row_idx]    # [M, C]
+        matched_gt_cls   = cls_gt_flat[bt_idx, col_idx]    # [M]
+        matched_pred_doa = doa_flat   [bt_idx, row_idx]    # [M, 3]
+        matched_gt_doa   = doa_gt_flat[bt_idx, col_idx]    # [M, 3]
+
+        cls_loss = focal_loss(matched_pred_cls, matched_gt_cls)
+        doa_loss = cosine_dist_loss(matched_pred_doa, matched_gt_doa)
+    else:
+        cls_loss = torch.tensor(0.0, device=device)
+        doa_loss = torch.tensor(0.0, device=device)
+
+    presence_loss = F.binary_cross_entropy_with_logits(conf_flat, conf_tgt)
+
+    return cls_loss + doa_loss + presence_loss + 0.5 * count_loss
 
 
 def compute_losses(layer_preds: list, gt: dict,
