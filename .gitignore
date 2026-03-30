@@ -53,3 +53,7 @@ Thumbs.db
 .claude/
 
 *.wav
+*.mp4
+
+/MRSAudio
+/runs_archive

@@ -138,16 +138,10 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
     doa_gt_flat = gt_doa.reshape(BT, S, 3)         # [BT, S, 3]
     mask_flat   = gt_mask.reshape(BT, S)           # [BT, S] bool
 
-    # ── Count loss (fully vectorised, no loop) ────────────────────────────────
-    count_loss = F.l1_loss(
-        torch.sigmoid(conf_flat).sum(-1),
-        mask_flat.float().sum(-1),
-    )
-
     # ── Build all [BT, S, S] cost matrices on GPU in one pass ─────────────────
-    # Active GT slots are packed to the front; inactive slots have class = -1.
-    # We clamp to 0 for safe indexing — inactive columns are excluded later
-    # by passing only cost[:, :n_active] to linear_sum_assignment.
+    # cls_cost ∈ [-1, 0]  (negative probability)
+    # doa_cost ∈ [0, 2]   (1 − cosine similarity)
+    # Scale doa by 0.5 so both terms have comparable magnitude ∈ [0, 1].
     with torch.no_grad():
         prob = logits_flat.softmax(-1)                            # [BT, S, C]
 
@@ -164,8 +158,8 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
         doa_cost  = 1.0 - torch.bmm(pred_norm, gt_norm.transpose(1, 2))  # [BT, S, S]
 
         # ONE GPU→CPU transfer for all cost matrices + mask
-        cost_np = (cls_cost + doa_cost).cpu().numpy()   # [BT, S, S]
-        mask_np = mask_flat.cpu().numpy()               # [BT, S] bool
+        cost_np = (cls_cost + 0.5 * doa_cost).cpu().numpy()   # [BT, S, S]
+        mask_np = mask_flat.cpu().numpy()                      # [BT, S] bool
 
     # ── Hungarian matching — pure CPU, zero GPU ops inside ────────────────────
     # Use actual active-column indices (not :n_act slice) so that col_arr always
@@ -210,7 +204,7 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
 
     presence_loss = F.binary_cross_entropy_with_logits(conf_flat, conf_tgt)
 
-    return cls_loss + doa_loss + presence_loss + 0.5 * count_loss
+    return cls_loss + doa_loss + presence_loss
 
 
 def compute_losses(layer_preds: list, gt: dict,
@@ -294,7 +288,14 @@ def compute_losses(layer_preds: list, gt: dict,
                 'confidence'  : dn_pos_conf,
             }
             dn_loss = _compute_single_layer_loss(dn_pred_pos, dn_gt)
-            total_loss = total_loss + w * 0.5 * dn_loss   # half-weight for DN
+
+            # Negative DN slots (second half of S_dn) should have confidence=0.
+            # This is the contrastive part: large-noise queries → inactive.
+            dn_neg_conf = dn_conf[:, :, n_pos:]   # [B, T, n_neg]
+            neg_conf_loss = F.binary_cross_entropy_with_logits(
+                dn_neg_conf, torch.zeros_like(dn_neg_conf)
+            )
+            total_loss = total_loss + w * 0.5 * (dn_loss + neg_conf_loss)
 
     return total_loss
 
@@ -383,12 +384,12 @@ def main():
         description='Train SLED v3.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--dataset-root',   default='./data')
-    parser.add_argument('--sofa-path',      default='./hrtf/p0001.sofa')
+    parser.add_argument('--dataset-root',   default='./data_custom_hrtf')
+    parser.add_argument('--sofa-path',      default='./hrtf/custom_mrs.sofa')
     parser.add_argument('--epochs',         type=int,   default=200)
-    parser.add_argument('--batch-size',     type=int,   default=8)
-    parser.add_argument('--lr',             type=float, default=1e-4)
-    parser.add_argument('--workers',        type=int,   default=4)
+    parser.add_argument('--batch-size',     type=int,   default=64)
+    parser.add_argument('--lr',             type=float, default=3e-4)
+    parser.add_argument('--workers',        type=int,   default=8)
     parser.add_argument('--device',         default='cuda' if torch.cuda.is_available()
                                                      else 'cpu')
     parser.add_argument('--checkpoint-dir', default='./checkpoints')
@@ -396,10 +397,19 @@ def main():
                         help='TensorBoard log directory')
     parser.add_argument('--resume',         type=str,   default=None,
                         help='Path to checkpoint to resume from')
-    parser.add_argument('--window-frames',  type=int,   default=256,
+    parser.add_argument('--window-frames',  type=int,   default=48,
                         help='Frames per training window (256 × 20ms = 5.12s)')
-    parser.add_argument('--d-model',        type=int,   default=256)
-    parser.add_argument('--n-classes',      type=int,   default=209)
+    parser.add_argument('--d-model',           type=int,   default=256)
+    parser.add_argument('--n-classes',         type=int,   default=209)
+    parser.add_argument('--min-loudness-db',   type=float, default=-60.0,
+                        help='Slots quieter than this (dBFS) are treated as '
+                             'inactive even if annotated as present')
+    parser.add_argument('--no-hrtf-corr',  action='store_true', default=False,
+                        help='Ablation: disable HRTF cross-corr heatmap')
+    parser.add_argument('--no-ild',        action='store_true', default=False,
+                        help='Ablation: disable ILD channel')
+    parser.add_argument('--no-ipd',        action='store_true', default=False,
+                        help='Ablation: disable IPD channels (sin/cos)')
     args = parser.parse_args()
 
     device = args.device
@@ -409,11 +419,19 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────────
     sofa_path = os.path.abspath(args.sofa_path)
-    print(f'[MODEL] Building SLEDv3 (d={args.d_model}, classes={args.n_classes})')
+    use_hrtf_corr = not args.no_hrtf_corr
+    use_ild       = not args.no_ild
+    use_ipd       = not args.no_ipd
+    in_channels   = 2 + int(use_ild) + 2 * int(use_ipd)
+    print(f'[MODEL] Building SLEDv3 (d={args.d_model}, classes={args.n_classes}, '
+          f'in_ch={in_channels}, ild={use_ild}, ipd={use_ipd}, hrtf_corr={use_hrtf_corr})')
     model = SLEDv3(
-        sofa_path  = sofa_path,
-        d_model    = args.d_model,
-        n_classes  = args.n_classes,
+        sofa_path      = sofa_path,
+        d_model        = args.d_model,
+        n_classes      = args.n_classes,
+        use_hrtf_corr  = use_hrtf_corr,
+        use_ild        = use_ild,
+        use_ipd        = use_ipd,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -440,22 +458,24 @@ def main():
     print(f'[DATA] Loading from {dataset_root}')
     use_pin = (device.type == torch.device('cuda').type if hasattr(device, 'type') else str(device).startswith('cuda'))
     train_loader = build_dataloader(
-        dataset_root  = dataset_root,
-        split         = 'train',
-        batch_size    = args.batch_size,
-        window_frames = args.window_frames,
-        augment_scs   = True,
-        num_workers   = args.workers,
-        pin_memory    = use_pin,
+        dataset_root    = dataset_root,
+        split           = 'train',
+        batch_size      = args.batch_size,
+        window_frames   = args.window_frames,
+        augment_scs     = True,
+        num_workers     = args.workers,
+        pin_memory      = use_pin,
+        min_loudness_db = args.min_loudness_db,
     )
     val_loader = build_dataloader(
-        dataset_root  = dataset_root,
-        split         = 'val',
-        batch_size    = args.batch_size,
-        window_frames = args.window_frames,
-        augment_scs   = False,
-        num_workers   = args.workers,
-        pin_memory    = use_pin,
+        dataset_root    = dataset_root,
+        split           = 'val',
+        batch_size      = args.batch_size,
+        window_frames   = args.window_frames,
+        augment_scs     = False,
+        num_workers     = args.workers,
+        pin_memory      = use_pin,
+        min_loudness_db = args.min_loudness_db,
     )
     print(f'       Train: {len(train_loader.dataset)} scenes | '
           f'Val: {len(val_loader.dataset)} scenes')
@@ -496,11 +516,14 @@ def main():
         # Save checkpoint every 10 epochs and when best
         if epoch % 10 == 0 or val_loss < best_val_loss:
             ckpt = {
-                'epoch'    : epoch,
-                'model'    : model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'val_loss' : val_loss,
+                'epoch'         : epoch,
+                'model'         : model.state_dict(),
+                'optimizer'     : optimizer.state_dict(),
+                'scheduler'     : scheduler.state_dict(),
+                'val_loss'      : val_loss,
+                'use_hrtf_corr' : use_hrtf_corr,
+                'use_ild'       : use_ild,
+                'use_ipd'       : use_ipd,
             }
             ckpt_path = os.path.join(
                 args.checkpoint_dir, f'sled_epoch_{epoch:04d}.pt'

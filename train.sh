@@ -1,0 +1,4 @@
+python -m sled.train --dataset-root ./data_custom_hrtf --batch-size 64 --lr 3e-4 --workers 8 --window-frames 48 --min-loudness-db -50.0 --d-model 256 --n-classes 209 --epochs 200 --checkpoint-dir ./checkpoints_ver6_hrtfed_50db --log-dir ./runs_ver6_hrtfed_50db --no-ild
+python -m sled.train --dataset-root ./data --batch-size 64 --lr 3e-4 --workers 8 --window-frames 48 --min-loudness-db -50.0 --d-model 256 --n-classes 209 --epochs 200 --checkpoint-dir ./checkpoints_ver6_noipd_50db --log-dir ./runs_ver6_noipd_50db --no-ipd
+python -m sled.train --dataset-root ./data --batch-size 64 --lr 3e-4 --workers 8 --window-frames 48 --min-loudness-db -50.0 --d-model 256 --n-classes 209 --epochs 200 --checkpoint-dir ./checkpoints_ver6_nobinaural_50db --log-dir ./runs_ver6_nobinaural_50db --no-ild --no-ipd --no-hrtf-corr
+bash ablation.sh

@@ -22,7 +22,7 @@ import librosa
 from scipy.signal import fftconvolve
 
 # ── Module-level paths ────────────────────────────────────────────────────────
-SOFA_PATH      = os.path.join(os.path.dirname(__file__), '..', '..', 'hrtf', 'p0001.sofa')
+SOFA_PATH      = os.path.join(os.path.dirname(__file__), '..', '..', 'hrtf', 'custom_mrs.sofa')
 SFX_DIR        = os.path.join(os.path.dirname(__file__), '..', '..', 'soud_effects')
 
 # ── Scene parameters ──────────────────────────────────────────────────────────
@@ -371,7 +371,7 @@ def compute_dense_annotations(events, n_samples, class_map, fs):
                                 frame_end   - ev['start_sample'])
                 seg_frame = ev['audio_segment'][seg_start:seg_end]
 
-                rms   = np.sqrt(np.mean(seg_frame ** 2) + eps)
+                rms   = np.sqrt(np.mean((ev['gain'] * seg_frame) ** 2) + eps)
                 loud  = 20.0 * np.log10(rms)
 
                 x, y, z = _az_el_to_unit_vector(ev['azimuth'], ev['elevation'])

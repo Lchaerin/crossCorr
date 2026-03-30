@@ -45,7 +45,7 @@ from sled.model.sled import SLEDv3
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 HOP_SAMPLES = 960
-FIG_W, FIG_H = 1400, 700   # pixels (figsize=(14,7), dpi=100)
+FIG_W, FIG_H = 1680, 700   # pixels (figsize=(16.8,7), dpi=100)
 
 # Up to 8 simultaneous GT events (tab10 palette)
 _GT_COLORS   = plt.cm.tab10(np.linspace(0, 1, 10))[:8]
@@ -137,23 +137,92 @@ def run_inference(model, audio_np: np.ndarray, device: str,
 # Ground-truth loader
 # =============================================================================
 
-def load_gt_per_frame(json_path: str, n_frames: int, sr: int = 48_000) -> list:
-    """Parse scene JSON → list[list[dict]]  (per annotation frame)."""
+def load_gt_per_frame(json_path: str, n_frames: int,
+                      audio_path: str | None = None) -> list:
+    """Parse scene JSON → list[list[dict]]  (per annotation frame).
+
+    Uses sample-based overlap check (identical to compute_dense_annotations)
+    so the GT display matches the npy annotations exactly.
+
+    If azimuth/elevation are null (MRS-mix format), DOA is loaded from the
+    npy annotation files sitting next to the JSON in ../annotations/<split>/.
+    """
     with open(json_path) as f:
         meta = json.load(f)
 
+    # Sanity-check: warn if JSON scene does not match the audio file.
+    if audio_path is not None:
+        audio_stem = os.path.splitext(os.path.basename(audio_path))[0]
+        json_scene = meta.get('scene_name', '')
+        json_audio = os.path.splitext(meta.get('audio_file', ''))[0]
+        if audio_stem and json_scene and audio_stem != json_scene:
+            print(
+                f'[GT] WARNING: audio file "{audio_stem}" does not match '
+                f'JSON scene_name "{json_scene}". GT labels may be wrong!'
+            )
+        elif audio_stem and json_audio and audio_stem != json_audio:
+            print(
+                f'[GT] WARNING: audio file "{audio_stem}" does not match '
+                f'JSON audio_file "{json_audio}". GT labels may be wrong!'
+            )
+
+    # Check if this is MRS-mix format (azimuth=null) → load from npy files
+    events = meta.get('events', [])
+    use_npy = events and events[0].get('azimuth') is None
+
+    gt_cls_arr = gt_doa_arr = gt_mask_arr = None
+    if use_npy:
+        # Infer annotation dir: <root>/annotations/<split>/ from json path
+        # json_path: <root>/audio/<split>/scene_NNNNNN.json
+        scene_name = meta.get('scene_name', os.path.splitext(os.path.basename(json_path))[0])
+        audio_dir  = os.path.dirname(json_path)
+        split_dir  = os.path.dirname(audio_dir)   # <root>/audio/
+        root_dir   = os.path.dirname(split_dir)    # <root>/
+        split_name = os.path.basename(audio_dir)   # 'train'/'val'/'test'
+        anno_dir   = os.path.join(root_dir, 'annotations', split_name)
+        cls_path   = os.path.join(anno_dir, f'{scene_name}_cls.npy')
+        doa_path   = os.path.join(anno_dir, f'{scene_name}_doa.npy')
+        mask_path  = os.path.join(anno_dir, f'{scene_name}_mask.npy')
+        if os.path.exists(cls_path) and os.path.exists(doa_path):
+            gt_cls_arr  = np.load(cls_path).astype(np.int32)   # [T, S]
+            gt_doa_arr  = np.load(doa_path).astype(np.float32)  # [T, S, 3]
+            gt_mask_arr = np.load(mask_path) if os.path.exists(mask_path) else (gt_cls_arr != -1)
+            print(f'[GT]    npy 어노테이션 로드: {anno_dir}')
+        else:
+            print(f'[GT] WARNING: npy 파일 없음 ({cls_path}), GT 생략')
+            use_npy = False
+
     gt_frames = []
     for t in range(n_frames):
-        t_sec  = t * HOP_SAMPLES / sr
         active = []
-        for ev in meta.get('events', []):
-            if ev['start_time'] <= t_sec < ev['end_time']:
-                az_sled = (-ev['azimuth']) % 360.0
-                key     = ev['file']
-                parts   = key.split('/', 1)
-                label   = parts[0] if len(parts) == 2 else os.path.splitext(parts[0])[0]
-                active.append({'azimuth': az_sled, 'elevation': ev['elevation'],
-                               'label': label})
+
+        if use_npy and gt_cls_arr is not None and t < gt_cls_arr.shape[0]:
+            # MRS-mix: read per-frame DOA from npy
+            for s in range(gt_cls_arr.shape[1]):
+                if not gt_mask_arr[t, s]:
+                    continue
+                cls_id = int(gt_cls_arr[t, s])
+                if cls_id < 0:
+                    continue
+                doa_vec = gt_doa_arr[t, s]   # [fwd, right, up]
+                az, el  = doa_to_az_el(doa_vec)
+                # source_event stored in JSON events by slot order
+                label = f'cls{cls_id}'
+                if s < len(events):
+                    label = events[s].get('source_event', label)
+                active.append({'azimuth': az, 'elevation': el, 'label': label})
+        else:
+            # Original format: fixed azimuth/elevation per event
+            frame_start = t * HOP_SAMPLES
+            frame_end   = frame_start + HOP_SAMPLES
+            for ev in events:
+                if ev['start_sample'] < frame_end and ev['end_sample'] > frame_start:
+                    az_sled = (-ev['azimuth']) % 360.0
+                    key     = ev['file']
+                    parts   = key.split('/', 1)
+                    label   = parts[0] if len(parts) == 2 else os.path.splitext(parts[0])[0]
+                    active.append({'azimuth': az_sled, 'elevation': ev['elevation'],
+                                   'label': label})
         gt_frames.append(active)
 
     return gt_frames
@@ -169,13 +238,14 @@ def render_frame(t: int, n_frames: int, sr: int,
                  audio_wave_L: np.ndarray,
                  conf_thresh: float) -> np.ndarray:
     """Return one rendered frame as a [H, W, 3] uint8 RGB array."""
-    fig = plt.figure(figsize=(14, 7), dpi=100, facecolor='#1a1a2e')
+    fig = plt.figure(figsize=(16.8, 7), dpi=100, facecolor='#1a1a2e')
     gs  = GridSpec(2, 3, figure=fig,
-                   width_ratios=[1.8, 0.05, 1.0], height_ratios=[5, 1],
-                   hspace=0.08, wspace=0.25,
-                   left=0.05, right=0.97, top=0.93, bottom=0.08)
+                   width_ratios=[1.4, 1.4, 0.9], height_ratios=[5, 1],
+                   hspace=0.08, wspace=0.30,
+                   left=0.04, right=0.97, top=0.93, bottom=0.08)
 
     ax_polar = fig.add_subplot(gs[0, 0], projection='polar', facecolor='#0d1b2a')
+    ax_azel  = fig.add_subplot(gs[0, 1], facecolor='#0d1b2a')
     ax_info  = fig.add_subplot(gs[0, 2], facecolor='#0d1b2a')
     ax_wave  = fig.add_subplot(gs[1, :], facecolor='#0d1b2a')
 
@@ -199,7 +269,7 @@ def render_frame(t: int, n_frames: int, sr: int,
     ax_polar.tick_params(colors='#444444')
     ax_polar.spines['polar'].set_color('#334155')
     ax_polar.grid(color='#334155', linestyle='--', linewidth=0.5, alpha=0.7)
-    ax_polar.set_title('Top-Down View  (radius = cos elevation)',
+    ax_polar.set_title('Top-Down View  (radius = cos el)',
                        color='#888888', fontsize=8, pad=10)
 
     # GT events
@@ -229,13 +299,55 @@ def render_frame(t: int, n_frames: int, sr: int,
                       f'{label[:12]}\n{conf:.2f}',
                       color=color, fontsize=6, ha='center', va='top', alpha=alpha)
 
-    legend_elems = [
-        mpatches.Patch(color='#aaaaaa', label='●  Ground truth'),
-        mpatches.Patch(color='#aaaaaa', label='★  Prediction'),
-    ]
+    legend_elems = []
+    if gt_frames is not None:
+        legend_elems.append(mpatches.Patch(color='#aaaaaa', label='●  Ground truth'))
+    legend_elems.append(mpatches.Patch(color='#aaaaaa', label='★  Prediction'))
     ax_polar.legend(handles=legend_elems, loc='lower right',
                     fontsize=7, facecolor='#1a1a2e', edgecolor='#334155',
                     labelcolor='#dddddd', framealpha=0.85)
+
+    # ── Azimuth-Elevation 2D scatter ──────────────────────────────────────────
+    ax_azel.set_facecolor('#0d1b2a')
+    ax_azel.set_xlim(0, 360)
+    ax_azel.set_ylim(-90, 90)
+    ax_azel.set_xticks([0, 90, 180, 270, 360])
+    ax_azel.set_xticklabels(['Front\n0°', 'Right\n90°', 'Back\n180°',
+                              'Left\n270°', '360°'],
+                             color='#cccccc', fontsize=7)
+    ax_azel.set_yticks([-90, -60, -30, 0, 30, 60, 90])
+    ax_azel.set_yticklabels(['-90°', '-60°', '-30°', '0°', '30°', '60°', '90°'],
+                             color='#888888', fontsize=7)
+    ax_azel.axhline(0, color='#556677', linewidth=0.8, linestyle='--')
+    ax_azel.grid(color='#334155', linestyle='--', linewidth=0.4, alpha=0.6)
+    ax_azel.set_xlabel('Azimuth', color='#888888', fontsize=7.5)
+    ax_azel.set_ylabel('Elevation', color='#888888', fontsize=7.5)
+    ax_azel.set_title('Azimuth–Elevation View', color='#888888', fontsize=8)
+    for sp in ax_azel.spines.values():
+        sp.set_color('#334155')
+    ax_azel.tick_params(colors='#444444')
+
+    # GT on az-el plot
+    for i, ev in enumerate(gt_events):
+        color = _GT_COLORS[i % len(_GT_COLORS)]
+        ax_azel.scatter(ev['azimuth'], ev['elevation'],
+                        s=180, c=[color], marker='o',
+                        edgecolors='white', linewidths=1.0, zorder=5, alpha=0.9)
+        ax_azel.text(ev['azimuth'], ev['elevation'] + 4, ev['label'][:12],
+                     color=color, fontsize=6, ha='center', va='bottom')
+
+    # Predictions on az-el plot
+    for s_idx in range(cls_arr.shape[1]):
+        conf   = conf_arr[t, s_idx]
+        az, el = doa_to_az_el(doa_arr[t, s_idx])
+        color  = _SLOT_COLORS[s_idx % len(_SLOT_COLORS)]
+        cls_id = int(cls_arr[t, s_idx])
+        label  = id_to_label.get(cls_id, f'cls{cls_id}')
+        alpha  = 0.95 if conf >= conf_thresh else max(0.25, conf)
+        ax_azel.scatter(az, el, s=200, c=[color], marker='*',
+                        edgecolors='white', linewidths=0.5, zorder=6, alpha=alpha)
+        ax_azel.text(az, el - 6, f'{label[:12]}\n{conf:.2f}',
+                     color=color, fontsize=6, ha='center', va='top', alpha=alpha)
 
     # ── Info panel ────────────────────────────────────────────────────────────
     ax_info.axis('off')
@@ -311,29 +423,45 @@ def main():
     parser.add_argument('--audio',          required=True)
     parser.add_argument('--ckpt',           required=True)
     parser.add_argument('--gt-json',        default=None)
-    parser.add_argument('--class-map',      default=None)
+    parser.add_argument('--class-map',      default=None,
+                        help='class_map.json 경로 (미지정 시 data/meta/class_map.json 자동 탐색)')
     parser.add_argument('--output',         default='viz.mp4')
     parser.add_argument('--fps',            type=int,   default=25)
     parser.add_argument('--conf-thresh',    type=float, default=0.35)
-    parser.add_argument('--window-frames',  type=int,   default=64)
+    parser.add_argument('--window-frames',  type=int,   default=48)
     parser.add_argument('--d-model',        type=int,   default=256)
-    parser.add_argument('--n-classes',      type=int,   default=209)
+    parser.add_argument('--n-classes',      type=int,   default=None,
+                        help='클래스 수 (미지정 시 체크포인트에서 자동 추출)')
     parser.add_argument('--sofa-path',      default='./hrtf/p0001.sofa')
     parser.add_argument('--device',
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 
     # ── Model ─────────────────────────────────────────────────────────────────
+    print('[MODEL] Loading checkpoint ...')
+    ckpt = torch.load(args.ckpt, map_location=args.device)
+
+    # Auto-detect n_classes: explicit arg > checkpoint meta > state_dict shape
+    if args.n_classes is not None:
+        n_classes = args.n_classes
+    elif 'n_classes' in ckpt:
+        n_classes = ckpt['n_classes']
+    else:
+        state = ckpt['model']
+        if 'heads.class_head.weight' in state:
+            n_classes = state['heads.class_head.weight'].shape[0]
+        else:
+            n_classes = 209
+    print(f'        n_classes={n_classes}  epoch={ckpt.get("epoch","?")}  '
+          f'val_loss={ckpt.get("val_loss", float("nan")):.4f}')
+
     print('[MODEL] Building SLEDv3 ...')
     model = SLEDv3(
         sofa_path  = os.path.abspath(args.sofa_path),
         d_model    = args.d_model,
-        n_classes  = args.n_classes,
+        n_classes  = n_classes,
     ).to(args.device)
-    ckpt = torch.load(args.ckpt, map_location=args.device)
     model.load_state_dict(ckpt['model'])
-    print(f'        epoch={ckpt.get("epoch","?")}  '
-          f'val_loss={ckpt.get("val_loss", float("nan")):.4f}')
 
     # ── Audio ─────────────────────────────────────────────────────────────────
     print('[AUDIO] Loading ...')
@@ -352,9 +480,22 @@ def main():
     gt_frames = None
     if args.gt_json:
         print('[GT]    Loading ground truth ...')
-        gt_frames = load_gt_per_frame(args.gt_json, n_frames, sr=sr)
+        gt_frames = load_gt_per_frame(args.gt_json, n_frames,
+                                       audio_path=args.audio)
 
-    id_to_label = build_id_to_label(args.class_map)
+    # class-map 자동 탐색: 명시 인자 없으면 프로젝트 기본 경로 시도
+    class_map_path = args.class_map
+    if not class_map_path:
+        _candidates = [
+            os.path.join(_ROOT, 'data', 'meta', 'class_map.json'),
+            os.path.join(_ROOT, 'data_test', 'meta', 'class_map.json'),
+        ]
+        for _c in _candidates:
+            if os.path.exists(_c):
+                class_map_path = _c
+                print(f'[LABEL]  class_map 자동 로드: {_c}')
+                break
+    id_to_label = build_id_to_label(class_map_path)
 
     # ── Render → ffmpeg pipe ──────────────────────────────────────────────────
     anno_fps    = sr / HOP_SAMPLES          # 50
@@ -369,7 +510,7 @@ def main():
     ffmpeg_video = [
         'ffmpeg', '-y',
         '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{FIG_W}x{FIG_H}', '-pix_fmt', 'rgb24',
+        '-s', f'{FIG_W}x{FIG_H}',  '-pix_fmt', 'rgb24',
         '-r', str(args.fps), '-i', '-',
         '-c:v', 'mpeg4', '-q:v', '3',
         '-pix_fmt', 'yuv420p', tmp_video,

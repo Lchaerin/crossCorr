@@ -77,22 +77,31 @@ def _build_mel_filterbank(n_fft: int, n_mels: int, sr: int,
 # =============================================================================
 
 class AudioPreprocessor(nn.Module):
-    """Converts stereo waveform → 6-channel feature tensor.
+    """Converts stereo waveform → feature tensor.
 
     Input  : [B, 2, N_samples]   stereo waveform at 48 kHz
-    Output : [B, 6, 64, T]       feature tensor
+    Output : [B, n_channels, 64, T]  where n_channels = 2 + use_ild + 2*use_ipd
+
+    Always-on channels:  0=L-mel, 1=R-mel
+    Optional channels:   ILD (ch2), sin/cos IPD (ch3/4), HRTF-corr heatmap (ch5)
     """
 
     def __init__(self, sofa_path: str, sr: int = 48_000,
                  n_fft: int = 2048, hop_length: int = 960,
-                 n_mels: int = 64, fmin: float = 20.0, fmax: float = 16_000.0):
+                 n_mels: int = 64, fmin: float = 20.0, fmax: float = 16_000.0,
+                 use_hrtf_corr: bool = True,
+                 use_ild: bool = True,
+                 use_ipd: bool = True):
         super().__init__()
-        self.sr         = sr
-        self.n_fft      = n_fft
-        self.hop_length = hop_length
-        self.n_mels     = n_mels
-        self.fmin       = fmin
-        self.fmax       = fmax
+        self.sr             = sr
+        self.n_fft          = n_fft
+        self.hop_length     = hop_length
+        self.n_mels         = n_mels
+        self.fmin           = fmin
+        self.fmax           = fmax
+        self.use_hrtf_corr  = use_hrtf_corr
+        self.use_ild        = use_ild
+        self.use_ipd        = use_ipd
 
         # ── Hann window ───────────────────────────────────────────────────────
         win = torch.hann_window(n_fft)
@@ -234,64 +243,66 @@ class AudioPreprocessor(nn.Module):
         ch1 = (mel_R_lin + eps).log10() * 10.0  # R-mel
 
         # ── ILD per mel band ─────────────────────────────────────────────────
-        # ILD = 10 * log10(mel_L / mel_R) [linear mel, before log]
-        ch2 = 10.0 * (mel_L_lin / (mel_R_lin + eps) + eps).log10()  # [B,64,T]
+        if self.use_ild:
+            ch2 = 10.0 * (mel_L_lin / (mel_R_lin + eps) + eps).log10()
+
+        # ── CSD (shared by IPD and HRTF-corr) ────────────────────────────────
+        need_csd = self.use_ipd or self.use_hrtf_corr
+        if need_csd:
+            csd_full = X_L * X_R.conj()   # [B, F, T] complex
 
         # ── IPD per mel band ─────────────────────────────────────────────────
-        # CSD = X_L * conj(X_R): [B, F, T] complex
-        csd_full = X_L * X_R.conj()
+        if self.use_ipd:
+            mel_csd_real = torch.einsum('mf,bft->bmt', mel_fb, csd_full.real)
+            mel_csd_imag = torch.einsum('mf,bft->bmt', mel_fb, csd_full.imag)
+            mel_csd_norm = (mel_csd_real.pow(2) + mel_csd_imag.pow(2) + eps).sqrt()
+            ch3 = mel_csd_imag / mel_csd_norm   # sin(IPD) [B, 64, T]
+            ch4 = mel_csd_real / mel_csd_norm   # cos(IPD) [B, 64, T]
 
-        # Average CSD phase over frequencies within each mel band
-        # mel_fb[m, f] = weight for mel band m at frequency f
-        # mel_csd[B, n_mels, T] = weighted sum of CSD over freq
-        mel_csd_real = torch.einsum('mf,bft->bmt', mel_fb, csd_full.real)
-        mel_csd_imag = torch.einsum('mf,bft->bmt', mel_fb, csd_full.imag)
-        # Normalise by L2 norm to get unit-vector (cos, sin)
-        mel_csd_norm = (mel_csd_real.pow(2) + mel_csd_imag.pow(2) + eps).sqrt()
-        ch3 = mel_csd_imag / mel_csd_norm   # sin(IPD) [B, 64, T]
-        ch4 = mel_csd_real / mel_csd_norm   # cos(IPD) [B, 64, T]
+        # ── HRTF cross-correlation heatmap ────────────────────────────────────
+        if self.use_hrtf_corr:
+            # Computed ONCE per window using the time-averaged CSD spectrum.
+            # Output: [B, az_bins=64, el_bins=32]  — fixed-size az × el spatial map.
 
-        # ── HRTF cross-correlation heatmap (channel 5) ────────────────────────
-        # Computed ONCE per window using the time-averaged CSD spectrum.
-        # Output: [B, az_bins=64, el_bins=T_stft]  — az × el 2D spatial map.
-        T_stft = X_L.shape[-1]
+            # Sample 8 evenly spaced frames across the window and average → [B, F]
+            T_stft    = csd_full.shape[-1]
+            idx8      = torch.linspace(0, T_stft - 1, 8).long()
+            csd_r_avg = csd_full.real[..., idx8].mean(dim=-1)
+            csd_i_avg = csd_full.imag[..., idx8].mean(dim=-1)
 
-        # Sample 8 evenly spaced frames across the window and average → [B, F]
-        T_stft   = csd_full.shape[-1]
-        idx8     = torch.linspace(0, T_stft - 1, 8).long()
-        csd_r_avg = csd_full.real[..., idx8].mean(dim=-1)
-        csd_i_avg = csd_full.imag[..., idx8].mean(dim=-1)
+            # Per-direction correlation  [B, N_DIR]
+            corr_unnorm = (
+                torch.einsum('df,bf->bd', self.W_real, csd_r_avg) -
+                torch.einsum('df,bf->bd', self.W_imag, csd_i_avg)
+            )
+            norm1_sq = torch.einsum('df,bf->bd', self.norm_hr_sq, pow_L[..., idx8].mean(dim=-1))
+            norm2_sq = torch.einsum('df,bf->bd', self.norm_hl_sq, pow_R[..., idx8].mean(dim=-1))
+            corr = corr_unnorm / (norm1_sq * norm2_sq + 1e-8).sqrt()   # [B, N_DIR]
 
-        # Per-direction correlation  [B, N_DIR]
-        corr_unnorm = (
-            torch.einsum('df,bf->bd', self.W_real, csd_r_avg) -
-            torch.einsum('df,bf->bd', self.W_imag, csd_i_avg)
-        )
-        norm1_sq = torch.einsum('df,bf->bd', self.norm_hr_sq, pow_L[..., idx8].mean(dim=-1))
-        norm2_sq = torch.einsum('df,bf->bd', self.norm_hl_sq, pow_R[..., idx8].mean(dim=-1))
-        corr = corr_unnorm / (norm1_sq * norm2_sq + 1e-8).sqrt()   # [B, N_DIR]
+            # Build 2D az × el grid  [B, az_bins=64, el_bins=32]
+            az_bins = self.n_mels    # 64
+            el_bins = 32             # fixed: ~5.6° per bin
 
-        # Build 2D az × el grid  [B, az_bins=64, el_bins=T_stft]
-        # azimuth: 64 bins covering 0°~360° (5.625° per bin)  ← larger dim
-        # elevation: T_stft bins covering -90°~+90° (adaptive resolution)  ← smaller dim
-        az_bins = self.n_mels    # 64
-        el_bins = T_stft
+            el_bin_float = (self.elevations + 90.0) / 180.0 * el_bins  # [N_DIR]
+            el_bin_idx   = el_bin_float.long().clamp(0, el_bins - 1)   # [N_DIR]
 
-        el_bin_float = (self.elevations + 90.0) / 180.0 * el_bins  # [N_DIR]
-        el_bin_idx   = el_bin_float.long().clamp(0, el_bins - 1)   # [N_DIR]
+            flat_idx   = self.az_bin_idx * el_bins + el_bin_idx         # [N_DIR]
+            flat_idx_b = flat_idx.view(1, -1).expand(B, -1)             # [B, N_DIR]
 
-        flat_idx   = self.az_bin_idx * el_bins + el_bin_idx         # [N_DIR]
-        flat_idx_b = flat_idx.view(1, -1).expand(B, -1)             # [B, N_DIR]
+            hrtf_flat  = corr.new_zeros(B, az_bins * el_bins)
+            count_flat = corr.new_zeros(B, az_bins * el_bins)
+            hrtf_flat.scatter_add_(1, flat_idx_b, corr)
+            count_flat.scatter_add_(1, flat_idx_b, torch.ones_like(corr))
 
-        hrtf_flat  = corr.new_zeros(B, az_bins * el_bins)
-        count_flat = corr.new_zeros(B, az_bins * el_bins)
-        hrtf_flat.scatter_add_(1, flat_idx_b, corr)
-        count_flat.scatter_add_(1, flat_idx_b, torch.ones_like(corr))
+            ch5 = (hrtf_flat / (count_flat + 1e-8)).view(B, az_bins, el_bins)
+        else:
+            ch5 = None
 
-        ch5 = (hrtf_flat / (count_flat + 1e-8)).view(B, az_bins, el_bins)
-        # [B, 64, T_stft]
-
-        # ── Stack channels 0-4; return ch5 separately ───────────────────────
-        # ch0-4 each [B, 64, T]; ch5 [B, 64_az, T_stft]
-        out = torch.stack([ch0, ch1, ch2, ch3, ch4], dim=1)  # [B, 5, 64, T]
-        return out, ch5   # ch5: [B, 64, T_stft]
+        # ── Stack active channels; return ch5 separately ─────────────────────
+        channels = [ch0, ch1]
+        if self.use_ild:
+            channels.append(ch2)
+        if self.use_ipd:
+            channels.extend([ch3, ch4])
+        out = torch.stack(channels, dim=1)  # [B, n_channels, 64, T]
+        return out, ch5   # ch5: [B, 64, 32] or None

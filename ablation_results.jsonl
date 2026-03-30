@@ -1,0 +1,1 @@
+{"ckpt": "/home/rllab/Desktop/crossCorr/checkpoints_ver6_50db/sled_best.pt", "epoch": 189, "use_ild": true, "use_ipd": true, "use_hrtf_corr": true, "split": "test", "test_loss": 1.9077, "det_f1": 0.9762, "det_prec": 0.997, "det_rec": 0.9562, "cls_acc": 0.1843, "doa_mae_deg": 18.39, "n_matched": 147932, "ms_per_frame": 0.0081, "total_frames": 128000}

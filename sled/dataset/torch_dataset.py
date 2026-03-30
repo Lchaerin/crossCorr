@@ -46,12 +46,14 @@ class SLEDDataset(Dataset):
     MAX_SLOTS   = 3
 
     def __init__(self, dataset_root: str, split: str,
-                 window_frames: int = 256, augment_scs: bool = True):
+                 window_frames: int = 256, augment_scs: bool = True,
+                 min_loudness_db: float = -60.0):
         super().__init__()
-        self.dataset_root  = dataset_root
-        self.split         = split
-        self.window_frames = window_frames
-        self.augment_scs   = augment_scs and (split == 'train')
+        self.dataset_root    = dataset_root
+        self.split           = split
+        self.window_frames   = window_frames
+        self.augment_scs     = augment_scs and (split == 'train')
+        self.min_loudness_db = min_loudness_db
 
         # Load split metadata
         split_meta_path = os.path.join(dataset_root, 'meta', 'split.json')
@@ -132,6 +134,14 @@ class SLEDDataset(Dataset):
         loud_w = _slice_pad_2d(loud_arr, t_start, t_end, -80)
         mask_w = _slice_pad_2d(mask_arr, t_start, t_end,  False)
 
+        # Suppress slots that are below the loudness threshold.
+        # Even if the JSON says a source is present, if it's inaudible
+        # the model should treat it as inactive.
+        too_quiet = loud_w < self.min_loudness_db   # [T, 5] bool
+        mask_w    = mask_w & ~too_quiet
+        cls_w     = cls_w.copy()
+        cls_w[too_quiet] = -1   # sentinel: inactive
+
         # Slice audio
         s_start = t_start * self.HOP_SAMPLES
         s_end   = t_end   * self.HOP_SAMPLES
@@ -186,6 +196,7 @@ def build_dataloader(
     window_frames: int = 256,
     augment_scs: bool = True,
     num_workers: int = 4,
+    min_loudness_db: float = -60.0,
     **kwargs,
 ) -> DataLoader:
     """Build a DataLoader for the given split.
@@ -206,10 +217,11 @@ def build_dataloader(
     """
     shuffle = kwargs.pop('shuffle', split == 'train')
     dataset = SLEDDataset(
-        dataset_root  = dataset_root,
-        split         = split,
-        window_frames = window_frames,
-        augment_scs   = augment_scs,
+        dataset_root    = dataset_root,
+        split           = split,
+        window_frames   = window_frames,
+        augment_scs     = augment_scs,
+        min_loudness_db = min_loudness_db,
     )
     pin_memory = kwargs.pop('pin_memory', True)
     return DataLoader(

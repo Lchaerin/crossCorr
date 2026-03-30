@@ -22,7 +22,7 @@ import soundfile as sf
 import librosa
 
 # ── 기본 경로 ─────────────────────────────────────────────────
-SOFA_PATH   = os.path.join(os.path.dirname(__file__), 'hrtf', 'p0001.sofa')
+SOFA_PATH   = os.path.join(os.path.dirname(__file__), 'hrtf', 'custom_mrs.sofa')
 SFX_DIR     = os.path.join(os.path.dirname(__file__), 'soud_effects')
 OUTPUT_DIR  = os.path.join(os.path.dirname(__file__), 'output')
 
