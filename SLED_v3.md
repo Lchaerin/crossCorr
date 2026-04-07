@@ -9,6 +9,7 @@
 4. [좌표계 규약](#4-좌표계-규약)
 5. [데이터셋](#5-데이터셋)
    - [5.6 MRS Mix 데이터셋](#56-mrs-mix-데이터셋-data_mrs_mix)
+   - [5.7 MRS Balanced 데이터셋](#57-mrs-balanced-데이터셋-data_mrs_balanced)
 6. [오디오 전처리기 (AudioPreprocessor)](#6-오디오-전처리기-audiopreprocessor)
 7. [인코더 (SLEDEncoder)](#7-인코더-sledencoder)
 8. [디코더](#8-디코더)
@@ -243,6 +244,29 @@ no-object (N+1 class)           Separate Presence Head (BCE)
 
 ## 4. 좌표계 규약
 
+### MRSAudio 좌표계 규약
+
+MRS npy 파일은 `(right_rel, forward_rel, up_rel, time_ms)` 형태의 카테시안 좌표로 저장된다.
+이를 방위각으로 표현하면: **az = atan2(forward, right)**
+
+| 방향 | (right, fwd) | atan2(fwd, right) |
+|---|---|---|
+| 정면 | (0, +1) | **90°** |
+| 오른쪽 | (+1, 0) | 0° |
+| **왼쪽** | (-1, 0) | **180°** |
+| 뒤 | (0, -1) | -90° (=270°) |
+
+→ **반시계방향(CCW), 90°=정면, 180°=왼쪽**
+
+SLED 규약(CW, 0°=정면)으로 변환:
+```python
+doa_sled = normalize([forward, right, up])   # x=fwd, y=right, z=up
+# SLED azimuth = atan2(right, forward) → 0°=정면, 90°=오른쪽 (CW)
+```
+이 변환으로 MRS CCW → SLED CW 가 올바르게 처리된다.
+
+---
+
 ### SOFA vs SLED 방위각
 
 SOFA: **반시계(CCW)**, 0°=앞, 90°=왼쪽
@@ -400,11 +424,81 @@ python -m sled.train \
     --weight-decay  1e-3
 ```
 
+#### 클래스 공간
+
+`data_mrs_mix`와 `data_custom_hrtf`(합성 데이터)는 **동일한 FSD50K 209-class 공간**을 공유한다.
+MRS mix는 그 중 15개 클래스만 실제로 사용(IDs: 11,26,34,36,39,48,57,87,111,133,137,160,165,177,194).
+class ID 충돌 없이 두 데이터셋을 바로 혼합 학습 가능.
+
 #### 주의: MRS Mix의 낮은 Loss ≠ 높은 성능
 
 MRS mix는 실제 클래스가 15개뿐, DOA 분포가 편중, 음원 조합이 반복적이라
 합성 데이터보다 Loss가 빨리 떨어지지만 실제 테스트 성능은 낮을 수 있음.
 합성 데이터 pretrained → MRS mix finetune 순서가 가장 효과적.
+
+#### DOA 편향 분석
+
+`data_mrs_mix` train 어노테이션의 active 프레임 azimuth 분포 (SLED CW, 0°=정면):
+
+```
+  -60°~ 60° (전방):  ~163,000 프레임   ← 집중
+  90°~180° / -90°~-180° (후방):  ~18,000 프레임
+  전방:후방 비율 ≈ 9:1
+```
+
+원인: MRS 실험 셋업이 리스너 앞쪽 위주. 이 편향으로 모델이 후방 음원도 전방으로 오인하는 문제 발생.
+→ 해결책: `data_mrs_balanced` (§5.7) 또는 합성 데이터와 혼합 학습.
+
+---
+
+### 5.7 MRS Balanced 데이터셋 (`data_mrs_balanced/`)
+
+`build_mrs_balanced_dataset.py`가 생성하는 **azimuth 균등 분포** MRS 데이터셋.
+포맷은 `data_mrs_mix`와 완전히 동일 — 같은 `SLEDDataset` / `train.py`로 바로 사용 가능.
+
+#### 균형화 방법
+
+전체 세그먼트를 azimuth bin별로 분류하고 `weight = 1 / bin_count` 부여:
+
+```
+bin_i 확률 = (bin_count_i × weight_i) / Σ(bin_count_j × weight_j)
+           = 1 / N_bins   (모든 bin 동일)
+```
+
+씬 생성 시 이 가중치로 세그먼트를 샘플링 → 모든 12개 방향 bin이 동일 확률.
+
+#### Train pool azimuth 분포 (sound001~166, 12 bins)
+
+```
+  -180~-150°:    86 segs  → weight 1/86   (후방, 희귀)
+  -150~-120°:    95 segs  → weight 1/95
+  -120~ -90°:   436 segs
+   -90~ -60°: 1,217 segs
+   -60~ -30°: 2,140 segs
+   -30~   0°: 2,335 segs
+     0~  30°: 2,063 segs
+    30~  60°: 1,914 segs
+    60~  90°: 1,060 segs
+    90~ 120°:   488 segs
+   120~ 150°:   121 segs
+   150~ 180°:    81 segs  → weight 1/81   (후방, 희귀)
+```
+
+희귀 후방 세그먼트(81~95개)는 같은 클립이 반복 등장하지만,
+랜덤 시작 위치 + ±6 dB 게인 증강으로 다양성 확보.
+
+#### 생성 명령어
+
+```bash
+python build_mrs_balanced_dataset.py \
+    --mrs-root ./MRSAudio/MRSLife/MRSSound \
+    --out-dir  ./data_mrs_balanced \
+    --n-train  6000 \
+    --n-val    750  \
+    --n-test   250  \
+    --n-bins   12   \
+    --seed     42
+```
 
 ---
 
@@ -718,6 +812,7 @@ dn_loss = pos_loss + neg_conf_loss
 ### 11.2 학습 명령어
 
 ```bash
+# 단일 데이터셋
 python -m sled.train \
     --dataset-root    ./data \
     --sofa-path       ./hrtf/p0001.sofa \
@@ -735,6 +830,53 @@ python -m sled.train --resume checkpoints/sled_best.pt [옵션들]
 ```
 
 **Linear Scaling Rule**: 배치를 K배 늘리면 lr도 K배.
+
+### 11.2b 혼합 데이터셋 학습
+
+두 데이터셋을 비율 조절하여 동시에 학습.
+
+#### 주요 인수
+
+| 인수 | 기본값 | 의미 |
+|---|---|---|
+| `--dataset-root2` | None | 2번 데이터셋 경로. 지정 시 혼합 활성화 |
+| `--mix-ratio W1 W2` | 1.0 1.0 | 두 데이터셋 샘플링 비율 (합계≠1 허용, 자동 정규화) |
+| `--val-mix-ratio VW1 VW2` | mix-ratio와 동일 | val 전용 비율. 생략 시 train 비율 그대로 |
+| `--epoch-size N` | N1+N2 | train 에폭당 총 샘플 수 |
+| `--val-size N` | N1_val+N2_val | val 에폭당 총 샘플 수 |
+
+`--mix-ratio 0.7 0.3`의 의미: 매 배치에서 70%는 dataset1, 30%는 dataset2에서 샘플링.
+각 데이터셋 내부에서는 모든 씬이 균등하게 뽑힘.
+
+val은 `WeightedRandomSampler(replacement=False, generator=seed(0))`로 결정론적 평가.
+
+#### 사용 예시
+
+```bash
+# 합성 7 : MRS balanced 3, val도 동일 비율
+python -m sled.train \
+    --dataset-root  ./data_custom_hrtf \
+    --dataset-root2 ./data_mrs_balanced \
+    --mix-ratio 0.7 0.3 \
+    --n-classes 209 \
+    --epochs 200
+
+# train 7:3, val은 MRS만으로 평가
+python -m sled.train \
+    --dataset-root  ./data_custom_hrtf \
+    --dataset-root2 ./data_mrs_balanced \
+    --mix-ratio 0.7 0.3 \
+    --val-mix-ratio 0 1 \
+    --n-classes 209
+
+# 에폭당 샘플 수 고정
+python -m sled.train \
+    --dataset-root  ./data_custom_hrtf \
+    --dataset-root2 ./data_mrs_balanced \
+    --mix-ratio 0.7 0.3 \
+    --epoch-size 10000 \
+    --val-size   1000
+```
 
 ### 11.3 DN 커리큘럼
 
@@ -945,13 +1087,16 @@ crossCorr/
 │   ├── meta/{class_map.json, split.json}
 │   ├── audio/{train,val,test}/   scene_NNNNNN.wav + .json
 │   └── annotations/{train,val,test}/  scene_NNNNNN_{cls,doa,loud,mask}.npy
+├── data_mrs_balanced/           azimuth 균등 MRS 데이터셋 (build_mrs_balanced_dataset.py 출력)
+│   └── (data_mrs_mix와 동일 구조)
 ├── MRSAudio/MRSLife/MRSSound/   원본 MRS binaural 녹음 (sound001~sound208)
 ├── checkpoints*/                학습 체크포인트
 ├── runs*/                       TensorBoard 로그
 ├── make_viz.sh                  배치 시각화 생성 스크립트
 ├── ablation.sh                  채널 ablation 자동화 스크립트
 ├── ablation_results.jsonl       ablation 결과 누적 파일
-├── build_mrs_mix_dataset.py     MRS binaural → 다중음원 씬 합성기
+├── build_mrs_mix_dataset.py     MRS binaural → 다중음원 씬 합성기 (DOA 편향 있음)
+├── build_mrs_balanced_dataset.py MRS → azimuth 균등 다중음원 씬 합성기
 ├── compare_mrs_ckpts.sh         MRS 체크포인트 2개 비교 스크립트
 └── sled/
     ├── model/
@@ -964,9 +1109,9 @@ crossCorr/
     ├── dataset/
     │   ├── synthesizer.py       씬 합성기 (합성 데이터셋용)
     │   ├── build_dataset.py     데이터셋 빌더 (멀티프로세싱)
-    │   ├── torch_dataset.py     SLEDDataset + build_dataloader
+    │   ├── torch_dataset.py     SLEDDataset + build_dataloader + build_mixed_dataloader
     │   └── mrs_dataset.py       MRS 단일음원 데이터셋 (train_mrs.py용)
-    ├── train.py                 학습 스크립트 (합성/MRS mix 데이터, --no-ild 등)
+    ├── train.py                 학습 스크립트 (단일/혼합 데이터, --mix-ratio, --val-mix-ratio 등)
     ├── train_mrs.py             MRS 단일음원 전용 학습 스크립트
     ├── eval.py                  평가 스크립트 (loss/F1/acc/DOA/time)
     ├── stream_bench.py          스트리밍 레이턴시 + 성능 벤치마크 (B=1)

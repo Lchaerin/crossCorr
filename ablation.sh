@@ -24,16 +24,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # =============================================================================
 # ★  CHECKPOINT PATHS  ★  — set these before running
 # =============================================================================
-CKPT_full="/home/rllab/Desktop/crossCorr/checkpoints_ver6_50db/sled_best.pt"
-CKPT_no_ild="/home/rllab/Desktop/crossCorr/checkpoints_ver6_noild_50db/sled_best.pt"
+CKPT_full="/home/rllab/Desktop/crossCorr/checkpoints_archive/checkpoints_ver6_50db/sled_best.pt"
+CKPT_no_ild="/home/rllab/Desktop/crossCorr/checkpoints_ver6_hrtfed_50db/sled_best.pt"
 CKPT_no_ipd="/home/rllab/Desktop/crossCorr/checkpoints_ver6_noipd_50db/sled_best.pt"
 CKPT_no_hrtf="/home/rllab/Desktop/crossCorr/checkpoints_ver6_nohrtf_50db/sled_best.pt"
 CKPT_no_binaural="/home/rllab/Desktop/crossCorr/checkpoints_ver6_nobinaural_50db/sled_best.pt"
 # =============================================================================
 
 # ── 공통 설정 ─────────────────────────────────────────────────────────────────
-DATASET_ROOT="./data"
-SOFA_PATH="./hrtf/p0001.sofa"
+DATASET_ROOT="./data_custom_hrtf"
+SOFA_PATH="./hrtf/custom_mrs.sofa"
 D_MODEL=256
 N_CLASSES=209
 DEVICE="cuda"

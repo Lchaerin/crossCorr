@@ -10,8 +10,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # =============================================================================
 # ★  비교할 체크포인트  ★
 # =============================================================================
-CKPT_ft="./checkpoints_mrs_mix_ft/sled_best.pt"
-CKPT_2="./checkpoints_mrs_mix2/sled_best.pt"
+CKPT_ft="./checkpoints_mrs_hrtf_ft/sled_best.pt"
+CKPT_2="./checkpoints_mrs_mix_ft/sled_best.pt"
 # =============================================================================
 
 DATASET_ROOT="./data_mrs_mix"

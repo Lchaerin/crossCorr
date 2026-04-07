@@ -1,6 +1,6 @@
 # SLED Dataset — Binaural Synthetic Dataset
 
-> 생성 기준: 2026-03-18
+> 생성 기준: 2026-04-06 (v2: 연속 위치 샘플링 + SRIR)
 > 학습 대상: SLED (Sound Localization & Event Detection) 모델
 > 입력 형식: Stereo binaural 44.1→48kHz, 2채널 WAV
 > 목표 규모: Train 10,000 + Val 1,000 + Test 500 scenes × 45s = **144시간**
@@ -76,11 +76,10 @@ dataset/
 
 ### 2.3 음원 위치
 
-- **Azimuth**: 균등 랜덤 [−π, π] (SLED CW convention: 0=front, +=right)
-- **Elevation**: 균등 랜덤 [−45°, +45°]
-- **이동 음원**: 전체 음원의 약 25%가 움직임
-  - 최대 4개 waypoint로 선형 보간
-  - Annotation에 per-frame DOA unit vector 기록
+- **Azimuth**: 연속 균등 랜덤 [−180°, +180°] (SLED CW: 0=front, +=right)
+- **Elevation**: 연속 균등 랜덤 [−45°, +45°]
+- 위치는 SOFA 측정 그리드에 구속되지 않음 — HRTFInterpolator(IDW)로 임의 방향 보간
+- 이동 음원: 현재 구현은 정적 위치 (moving source 지원 예정)
 
 ### 2.4 Onset / Offset
 
@@ -91,53 +90,57 @@ dataset/
 
 ## 3. 합성 파이프라인
 
-### 3.1 흐름도
+### 3.1 흐름도 (v2: 연속 위치 + SRIR)
 
 ```
-FSD50K mono clip
-  │   (resample to 48 kHz, loop/crop to 45 s)
+SFX mono clip
+  │   (resample to 48 kHz, loop/crop)
   │
-  ├─── 1. 위치 배정 (az, el) + 이동 trajectory 생성
+  ├─── 1. 위치 배정: (az, el) 연속 균등 랜덤 샘플링
+  │         az ∈ [−180°, +180°]  el ∈ [−45°, +45°]
   │
   ├─── 2. Loudness GT 계산 ← dry mono per-frame RMS → dBFS
-  │         (합성 이전 개별 음원 기준; SLED 모델 regression target)
   │
-  ├─── 3. SRIR 룩업 (TAU-SRIR_DB)
-  │         → 가장 가까운 azimuth의 FOA RIR (4ch, 48 kHz, ~300 ms)
+  ├─── 3. HRTF 보간 (binaural_engine.HRTFInterpolator, IDW, K=3)
+  │         → 정확한 연속 위치에서의 HRIR (hrir_l, hrir_r)
   │
-  ├─── 4. FOA → Binaural 변환 (BF Filter, precomputed per HRTF subject)
-  │         → BRIR (2, ~14,655 samples)
+  ├─── 4. SRIR 룩업 (TAU-SRIR_DB, W-channel)
+  │         → 씬당 랜덤 room + RT60 + dist 조건 선택
+  │         → 원형 room: 가장 가까운 1° 단위 az의 W-channel
+  │            비원형 room: 랜덤 trajectory position의 W-channel
+  │         → srir_w (14,400 samples @ 48 kHz)
   │
-  └─── 5. Overlap-Add 합성 (oaconvolve)
-          → binaural spatialized source (2, 45 s + reverb tail)
+  ├─── 5. BRIR 합성
+  │         BRIR_L = conv(srir_w, hrir_l)   ← 방향: HRTF / 잔향: SRIR
+  │         BRIR_R = conv(srir_w, hrir_r)
+  │
+  └─── 6. Overlap-Add 합성 (oaconvolve)
+          → binaural spatialized source
 
 All sources → Mix (sum)
   │
-  ├─── 6. TAU-SNoise ambient noise 추가
-  │         (FOA partial read → binaural decode → SNR scaling [5–25 dB])
-  │
   └─── 7. Peak normalize → stereo WAV + JSON + dense .npy 저장
+          (별도 노이즈 추가 없음 — SRIR 잔향 꼬리에 room noise 포함)
 ```
 
-### 3.2 FOA → Binaural 변환 원리
+### 3.2 연속 위치 렌더링 원리
 
-**Virtual Loudspeaker (VLS) 방법:**
+**방향 (HRTF)**:  
+`binaural_engine.HRTFInterpolator`가 임의의 (az, el)에서 주파수 영역 IDW 보간으로 HRIR을 계산한다.
+- K=3 최근접 측정 방향 탐색 (geodesic 거리)
+- log-magnitude 가중 평균 + nearest-phase → 위상 smearing 없음
+- SOFA 그리드에 구속되지 않아 연속적 방향 표현 가능
 
-1. Golden spiral로 50-point VLS 그리드 생성 (구 위에 균일 분포)
-2. 각 VLS 위치에서 FOA encoding vector: `[W, Y, Z, X]` (ACN/SN3D)
-3. **Binaural FOA Filter (BF)** 사전 계산 (HRTF subject당 1회):
-   ```
-   BF[foa_ch, ear, :] = Σ_k (4π/N_vls) × Y[k, foa_ch] × HRTF_k[ear, :]
-   ```
-   `BF shape: (4, 2, 256)`  — HRTF subject당 캐시됨
-4. **BRIR 합성** (SRIR position당):
-   ```
-   BRIR[ear] = Σ_j convolve(SRIR_foa[j], BF[j, ear])
-   ```
-   `BRIR shape: (2, 14,655 samples)`
-5. **Spatialization**: `mono_audio ★ BRIR` (overlap-add)
+**공간 음향 (SRIR)**:  
+TAU-SRIR_DB의 FOA W-channel (무지향성)을 room acoustics 필터로 사용한다.
+- W-channel = 0차 ambisonics (omnidirectional) → 방향 편향 없이 잔향만 제공
+- 씬당 1개 room+조건 공유 → 물리적 일관성
+- SRIR 측정 자체에 room ambient noise 포함 → 별도 노이즈 불필요
 
-**효과**: SRIR이 실제 공간의 room acoustics(잔향, 조기반사)를 제공하고, HRTF가 머리 형태에 따른 방향 단서(ITD, ILD)를 제공. 두 요소가 물리적으로 올바르게 결합됨.
+**BRIR = conv(SRIR_W, HRIR)**:  
+- HRTF가 정확한 연속 방향 단서 (ITD, ILD, spectral notch) 제공
+- SRIR이 실제 room의 잔향·초기 반사 제공
+- BRIR 길이 ≈ 14,400 + 256 − 1 = 14,655 samples
 
 ### 3.3 Loudness Ground Truth
 
@@ -157,12 +160,14 @@ per_source_loudness[frame] = 20 × log10( RMS( mono_dry[frame×hop : (frame+1)×
 
 | 항목 | 값 |
 |---|---|
-| Subjects | 140개 (.sofa 파일) |
+| Subjects | 140개 (p0001.sofa ~ p0205.sofa, hrtf/ 디렉터리) |
+| 씬당 선택 방식 | **씬마다 140개 중 랜덤 1명** 선택 → HRTF 다양성 확보 |
 | Positions per subject | 828 |
 | HRIR length | 256 samples (at 48 kHz = 5.3 ms) |
 | Sample rate | 48,000 Hz |
 | Format | SOFA (HDF5) |
-| 좌표 | azimuth 0–360° CCW (SOFA) → CW 변환 후 사용 |
+| 보간 방식 | HRTFInterpolator (IDW, K=3) → 임의 연속 위치에서 HRIR 합성 |
+| 좌표 | azimuth 0–360° CCW (SOFA) → SLED CW 변환: az_sofa = -az_sled |
 
 ### 4.2 TAU-SRIR Database
 
@@ -274,12 +279,11 @@ dataset/synthesizer/
 - `build_brir(srir_foa, bf)` → BRIR `(2, 14655)`: 8번의 FFT 합성곱
 - `spatialize(mono, brir)` → binaural: **`oaconvolve`** 사용 (긴 신호 × 짧은 필터에 최적)
 
-**`scene_synth.py`** — 씬 합성
-- `synthesize_scene()`: SRIR/HRTF/FSD50K를 조합해 1개 씬 생성
-- `_spatialize_with_trajectory()`: 블록 기반 시변 렌더링
-  - static source → 1 BRIR × 1 convolution
-  - moving source → 16 blocks × 1 BRIR each (캐싱으로 중복 계산 방지)
-- `_load_snoise()`: 노이즈 파일 partial read (28분 파일 전체 로드 회피)
+**`synthesizer.py`** — 씬 합성 (v2)
+- `synthesize_scene()`: SOFA HRTF + TAU-SRIR + SFX를 조합해 1개 씬 생성
+- 연속 (az, el) 샘플링 → HRTFInterpolator로 보간 → 오차 없는 DOA annotation
+- 씬당 1개 room+조건 공유, 소스별 독립적 연속 방향
+- SRIR W-channel을 room acoustics 필터로 사용 (노이즈 별도 추가 없음)
 
 **`run_synthesis.py`** — 병렬 합성
 - `mp.Pool(spawn)`: 각 워커가 독립적인 HRTF/SRIR/FSD50K 인스턴스 소유
@@ -337,28 +341,42 @@ train_loader = build_dataloader(
 ## 8. 합성 실행
 
 ```bash
-cd dataset/synthesizer
+cd /home/rllab/Desktop/crossCorr
 
-# 전체 데이터셋 합성 (16 worker, ~12분 예상)
-python run_synthesis.py --split all --workers 16
+# ── 전체 데이터셋 합성 (10k train + 1k val + 500 test, 16 workers) ──────────
+python -m sled.dataset.build_dataset \
+    --output-dir ./data \
+    --num-train 10000 --num-val 1000 --num-test 500 \
+    --workers 16
 
-# 재개 (중단 후)
-python run_synthesis.py --split train --resume --workers 16
+# ── 빠른 smoke test (씬 10개, 1 worker) ──────────────────────────────────────
+python -m sled.dataset.build_dataset \
+    --output-dir ./data_test \
+    --num-train 10 --num-val 2 --num-test 2 \
+    --workers 1
 
-# 검증 (1개 씬 합성 + 형식 확인)
-python verify_dataset.py
+# ── 중단 후 재개 ──────────────────────────────────────────────────────────────
+python -m sled.dataset.build_dataset \
+    --output-dir ./data \
+    --workers 16 --resume
 
-# 메타 파일만 재빌드 (split.json 갱신 등)
-python build_meta.py
+# ── 커스텀 경로 지정 ──────────────────────────────────────────────────────────
+python -m sled.dataset.build_dataset \
+    --output-dir  ./data \
+    --hrtf-dir    ./hrtf \
+    --sfx-dir     ./soud_effects \
+    --srir-dir    ./sources/TAU_SRIR/TAU-SRIR_DB \
+    --workers 16
 ```
 
-**성능 (실측):**
+**성능 (30초 씬 기준 추정):**
 
 | 항목 | 값 |
 |---|---|
-| 45초 씬 합성 시간 (single core) | ~1 sec |
-| 16 워커 처리량 | ~16 scenes/sec |
-| 전체 11,500 씬 예상 시간 | ~12분 |
+| 30초 씬 합성 시간 (single core) | ~3–8 sec (SOFA 로드 포함) |
+| SOFA 로드 overhead (씬당) | ~0.3 sec (HRTFInterpolator 생성) |
+| 16 워커 처리량 | ~2–5 scenes/sec |
+| 전체 11,500 씬 예상 시간 | ~30–90분 |
 
 ---
 
@@ -381,13 +399,15 @@ python build_meta.py
 합성 전 **dry mono 기준** RMS를 측정. 공간화(잔향, HRTF 레벨 변화)에 의존하지 않아야 SLED 모델이 intrinsic loudness를 학습할 수 있음.
 
 ### SRIR 좌표 규약
-- TAU-SRIR DB: 원형 배열 room의 360개 position = azimuth 0°~359° (CCW)
-- 코드 내부에서 SLED CW convention (0=front, +=right)으로 변환
-- 비원형 room(sa203 등): 측정된 trajectory position에서 랜덤 선택
+- TAU-SRIR DB: 원형 room의 360개 position = azimuth 0°~359° (1° 간격, CCW)
+- 소스 az (SLED CW) → SRIR index 변환: `az_idx = round((-az_sled) % 360) % 360`
+- 비원형 room (sa203 등): trajectory position, 좌표 불명 → 랜덤 선택
+- SRIR 잔향이 방향 정보를 포함하지만, W-channel 사용으로 directional bias 최소화
 
 ### HRTF 좌표 규약
-- SOFA azimuth: 0=front, 90=left (CCW) → `az_sled = -az_sofa` 변환
-- 828개 측정 위치 → KD-tree (3D unit vector)로 최근접 위치 검색
+- SOFA azimuth: 0=front, 90=left (CCW) ↔ SLED CW: `az_sofa = -az_sled`
+- HRTFInterpolator: K=3 IDW 보간 → 임의 연속 위치에서 HRIR 합성
+- annotation DOA = HRTF에 사용된 정확한 (az, el) 기준 → 오차 없음
 
 ### on-the-fly vs pre-synthesized
 현재 구현은 **pre-synthesized** (디스크에 미리 저장).
@@ -400,7 +420,12 @@ SLED 모델 설계: 300 클래스 + 1 empty
 → 현재 데이터셋은 FSD50K 200 클래스 사용. 추가 데이터소스(AudioSet segments 등) 확보 시 301개 full class 활용 가능.
 
 ### 이동 음원 렌더링
-블록 기반 (16 blocks per source): 매 block마다 midpoint azimuth에서 BRIR 계산.
-동일 SRIR bin이면 이전 BRIR 재사용(캐싱) → static source = 1 BRIR.
-엄밀한 time-varying convolution 대신 piecewise-stationary approximation.
-블록 경계에서의 불연속은 잔향이 masking함.
+현재 구현: 정적 위치 (씬 내 동일 az/el). 이동 음원 지원 예정.
+연속 위치이므로 임의의 고밀도 waypoint도 HRTFInterpolator로 직접 보간 가능.
+
+### SRIR + HRTF 결합 방식 (v2)
+- **W-channel 전용**: FOA의 0차 채널 (omnidirectional) 만 사용
+  - 방향 편향 없이 room reverb character만 제공
+  - 방향 단서는 100% HRTFInterpolator가 담당
+- **오차 없는 DOA annotation**: 샘플된 (az, el)이 HRTF에 직접 사용됨
+  (구 SOFA nearest-neighbor 방식의 discrete position 오차 제거)
