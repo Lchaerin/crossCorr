@@ -2,13 +2,39 @@
 """
 SLED v3 — Dataset Builder
 ==========================
-Builds train / val / test splits of binaural scenes.
+Builds train / val / test splits of binaural scenes with strict data separation:
+
+  FSD50K clips
+    train  ← dev.csv  split='train'   (~36,796 clips)
+    val    ← dev.csv  split='val'     (~4,170  clips)
+    test   ← eval.csv (all)           (~10,231 clips)
+
+  SRIR rooms
+    train  ← 7 rooms  (bomb_shelter, gym, pb132, pc226, sa203, sc203, se203)
+    val    ← 2 rooms  (tb103, tc352)   ← unseen during training
+    test   ← 2 rooms  (tb103, tc352)   ← same held-out set
+
+  HRTF subjects
+    all splits ← random from 140 p*.sofa  (no split; ears are listener-generic)
 
 Usage
 -----
-    python build_dataset.py [--output-dir PATH] [--num-train N]
-                            [--num-val N] [--num-test N]
-                            [--workers N] [--seed N] [--resume]
+    # Full dataset (16 workers)
+    python -m sled.dataset.build_dataset --output-dir ./data --workers 16
+
+    # Quick smoke test
+    python -m sled.dataset.build_dataset --output-dir ./data_test \\
+        --num-train 10 --num-val 2 --num-test 2 --workers 1
+
+    # Resume interrupted build
+    python -m sled.dataset.build_dataset --output-dir ./data --workers 16 --resume
+
+    # Custom paths
+    python -m sled.dataset.build_dataset --output-dir ./data \\
+        --hrtf-dir ./hrtf --sfx-dir ./soud_effects \\
+        --srir-dir ./sources/TAU_SRIR/TAU-SRIR_DB \\
+        --fsd50k-gt-dir ./sources/FSD50K/FSD50K.ground_truth \\
+        --workers 16
 """
 
 import argparse
@@ -20,88 +46,103 @@ import sys
 import numpy as np
 import soundfile as sf
 
-# Resolve the package root so we can import sled.dataset even when invoked
-# directly as a script.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.join(_HERE, '..', '..')
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from sled.dataset.synthesizer import (
-    SOFA_PATH, SFX_DIR,
-    load_sofa, scan_sfx_paths, load_sfx_from_paths, build_class_map,
+    HRTF_DIR, SFX_DIR, SRIR_DIR, FSD50K_GT_DIR,
+    SRIR_TRAIN_ROOMS, SRIR_EVAL_ROOMS,
+    scan_sofa_paths, scan_sfx_split_paths, scan_sfx_paths,
+    load_sfx_from_paths, build_class_map,
     synthesize_scene,
 )
 
 # ── Split scene-id offsets ────────────────────────────────────────────────────
-SPLIT_OFFSETS = {'train': 0, 'val': 10_000, 'test': 11_000}
+SPLIT_OFFSETS = {'train': 0, 'val': 20_000, 'test': 22_500}
+
+# ── SRIR rooms per split ──────────────────────────────────────────────────────
+_SRIR_ROOMS_PER_SPLIT = {
+    'train': SRIR_TRAIN_ROOMS,
+    'val':   SRIR_EVAL_ROOMS,
+    'test':  SRIR_EVAL_ROOMS,
+}
 
 
 # =============================================================================
-# Synthetic tone generator (fallback when soud_effects/ is empty)
+# Helpers
 # =============================================================================
 
 def _generate_synthetic_tones(sfx_dir, fs=48_000, duration=4.0):
-    """Generate 10 synthetic sine-wave tones and save as WAV to sfx_dir."""
+    """Generate 10 synthetic sine-wave tones (fallback when sfx_dir is empty)."""
     freqs = [220, 330, 440, 550, 660, 880, 1100, 1320, 1760, 2200]
     t = np.linspace(0, duration, int(fs * duration), endpoint=False)
     os.makedirs(sfx_dir, exist_ok=True)
     for freq in freqs:
-        fname = f'tone_{freq}hz.wav'
-        fpath = os.path.join(sfx_dir, fname)
+        fpath = os.path.join(sfx_dir, f'tone_{freq}hz.wav')
         if not os.path.exists(fpath):
-            wave = 0.5 * np.sin(2.0 * np.pi * freq * t).astype(np.float32)
-            sf.write(fpath, wave, fs)
+            sf.write(fpath, 0.5 * np.sin(2.0 * np.pi * freq * t).astype(np.float32), fs)
     print(f'[SFX] Generated {len(freqs)} synthetic tones in {sfx_dir}')
 
 
+def _read_sofa_fs(sofa_path):
+    """Read sample rate from a SOFA file without loading all data."""
+    try:
+        import netCDF4 as _nc
+        ds = _nc.Dataset(sofa_path, 'r')
+        fs = int(np.asarray(ds.variables['Data.SamplingRate'][:])[0])
+        ds.close()
+        return fs
+    except Exception:
+        import h5py as _h5
+        with _h5.File(sofa_path, 'r') as f:
+            return int(np.array(f['Data.SamplingRate']).flat[0])
+
+
 # =============================================================================
-# Worker initialiser / task function (for multiprocessing)
+# Worker initialiser / task function
 # =============================================================================
 
 _WORKER_STATE: dict = {}
 
 
-def _worker_init(sofa_path, sfx_paths, class_map, max_sfx_files):
-    """Called once per worker process to load shared resources."""
-    hrir_l, hrir_r, azimuths, elevations, fs_hrtf = load_sofa(sofa_path)
-    # Each worker loads a different random subset of clips (seed = pid).
-    sfx = load_sfx_from_paths(sfx_paths, int(fs_hrtf),
+def _worker_init(sofa_paths, sfx_paths, class_map, max_sfx_files,
+                 srir_dir, srir_rooms, fs):
+    """Called once per worker process.  HRTF subject chosen per scene."""
+    sfx = load_sfx_from_paths(sfx_paths, fs,
                                max_files=max_sfx_files, seed=os.getpid())
-    _WORKER_STATE['hrir_l']     = hrir_l
-    _WORKER_STATE['hrir_r']     = hrir_r
-    _WORKER_STATE['azimuths']   = azimuths
-    _WORKER_STATE['elevations'] = elevations
-    _WORKER_STATE['fs']         = int(fs_hrtf)
+    _WORKER_STATE['sofa_paths'] = sofa_paths
+    _WORKER_STATE['fs']         = fs
     _WORKER_STATE['sfx']        = sfx
     _WORKER_STATE['class_map']  = class_map
+    _WORKER_STATE['srir_dir']   = srir_dir
+    _WORKER_STATE['srir_rooms'] = srir_rooms
 
 
 def _synthesize_task(args):
-    """Top-level function (picklable) executed by each pool worker."""
     name, audio_dir, anno_dir, seed = args
     try:
         synthesize_scene(
-            name          = name,
-            hrir_l        = _WORKER_STATE['hrir_l'],
-            hrir_r        = _WORKER_STATE['hrir_r'],
-            azimuths      = _WORKER_STATE['azimuths'],
-            elevations    = _WORKER_STATE['elevations'],
-            sfx           = _WORKER_STATE['sfx'],
-            class_map     = _WORKER_STATE['class_map'],
-            output_dir    = audio_dir,   # WAV + JSON go here
-            fs            = _WORKER_STATE['fs'],
-            seed          = seed,
+            name       = name,
+            sofa_paths = _WORKER_STATE['sofa_paths'],
+            sfx        = _WORKER_STATE['sfx'],
+            class_map  = _WORKER_STATE['class_map'],
+            output_dir = audio_dir,
+            fs         = _WORKER_STATE['fs'],
+            srir_dir   = _WORKER_STATE['srir_dir'],
+            srir_rooms = _WORKER_STATE['srir_rooms'],
+            seed       = seed,
         )
-        # Move annotation .npy files to annotations directory
         for suffix in ('_cls.npy', '_doa.npy', '_loud.npy', '_mask.npy'):
             src = os.path.join(audio_dir, f'{name}{suffix}')
             dst = os.path.join(anno_dir,  f'{name}{suffix}')
             if os.path.exists(src):
                 os.replace(src, dst)
         return name, None
-    except Exception as exc:
-        return name, str(exc)
+    except Exception:
+        import traceback
+        return name, traceback.format_exc()
 
 
 # =============================================================================
@@ -109,16 +150,16 @@ def _synthesize_task(args):
 # =============================================================================
 
 def _build_split(split, n_scenes, output_dir, workers, seed, resume,
-                 sfx_paths, class_map, max_sfx_files):
-    """Build all scenes for one split, using multiprocessing."""
+                 sofa_paths, sfx_paths, class_map, max_sfx_files,
+                 srir_dir, srir_rooms, fs):
     try:
         from tqdm import tqdm
         _tqdm = tqdm
     except ImportError:
         class _tqdm:
             def __init__(self, it=None, **kw):
+                print(f'[{split}] generating {kw.get("total","?")} scenes ...')
                 self._it = it
-                print(f'[{split}] generating {kw.get("total", "?")} scenes ...')
             def __enter__(self): return self
             def __exit__(self, *a): pass
             def __iter__(self): return iter(self._it)
@@ -134,23 +175,23 @@ def _build_split(split, n_scenes, output_dir, workers, seed, resume,
 
     tasks = []
     for i in range(n_scenes):
-        scene_id  = base_id + i
-        name      = f'scene_{scene_id:06d}'
-        wav_path  = os.path.join(audio_dir, f'{name}.wav')
+        scene_id   = base_id + i
+        name       = f'scene_{scene_id:06d}'
+        wav_path   = os.path.join(audio_dir, f'{name}.wav')
         if resume and os.path.exists(wav_path):
             continue
-        scene_seed = int(rng.randint(0, 2**31 - 1))
-        tasks.append((name, audio_dir, anno_dir, scene_seed))
+        tasks.append((name, audio_dir, anno_dir, int(rng.randint(0, 2**31 - 1))))
 
     if not tasks:
         print(f'[{split}] All scenes already exist — skipping.')
         return
 
-    ctx = mp.get_context('spawn')
+    ctx  = mp.get_context('spawn')
     pool = ctx.Pool(
         processes   = max(1, workers),
         initializer = _worker_init,
-        initargs    = (SOFA_PATH, sfx_paths, class_map, max_sfx_files),
+        initargs    = (sofa_paths, sfx_paths, class_map,
+                       max_sfx_files, srir_dir, srir_rooms, fs),
     )
 
     errors = []
@@ -158,14 +199,15 @@ def _build_split(split, n_scenes, output_dir, workers, seed, resume,
         for name, err in pool.imap_unordered(_synthesize_task, tasks):
             if err:
                 errors.append((name, err))
-                print(f'\n  [ERROR] {name}: {err}')
+                print(f'\n  [ERROR] {name}:\n{err}')
             pbar.update(1)
 
     pool.close()
     pool.join()
 
-    if errors:
-        print(f'[{split}] {len(errors)} scene(s) failed.')
+    n_err = len(errors)
+    if n_err:
+        print(f'[{split}] {n_err} scene(s) failed.')
     else:
         print(f'[{split}] Done — {len(tasks)} scene(s) synthesised.')
 
@@ -176,88 +218,118 @@ def _build_split(split, n_scenes, output_dir, workers, seed, resume,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Build SLED v3 training dataset.',
+        description='Build SLED v3 binaural training dataset.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--output-dir', default='./data',
-                        help='Root directory for the dataset')
-    parser.add_argument('--num-train', type=int, default=100)
-    parser.add_argument('--num-val',   type=int, default=20)
-    parser.add_argument('--num-test',  type=int, default=10)
-    parser.add_argument('--workers',   type=int, default=4,
-                        help='Number of parallel worker processes')
-    parser.add_argument('--seed',         type=int, default=42)
-    parser.add_argument('--resume',       action='store_true',
+    parser.add_argument('--output-dir',      default='./data')
+    parser.add_argument('--hrtf-dir',        default=HRTF_DIR,
+                        help='Directory containing p*.sofa HRTF files')
+    parser.add_argument('--sfx-dir',         default=SFX_DIR,
+                        help='Directory containing sound effect clips (class/ layout)')
+    parser.add_argument('--srir-dir',        default=SRIR_DIR,
+                        help='Path to TAU-SRIR_DB directory')
+    parser.add_argument('--fsd50k-gt-dir',   default=FSD50K_GT_DIR,
+                        help='Path to FSD50K.ground_truth/ (for split-aware clip selection)')
+    parser.add_argument('--num-train',       type=int, default=20_000)
+    parser.add_argument('--num-val',         type=int, default=1_500)
+    parser.add_argument('--num-test',        type=int, default=500)
+    parser.add_argument('--workers',         type=int, default=4)
+    parser.add_argument('--seed',            type=int, default=42)
+    parser.add_argument('--resume',          action='store_true',
                         help='Skip scenes whose WAV already exists')
-    parser.add_argument('--max-sfx-files', type=int, default=500,
+    parser.add_argument('--max-sfx-files',   type=int, default=500,
                         help='Max SFX clips loaded per worker (0 = all)')
+    parser.add_argument('--no-split-sfx',    action='store_true',
+                        help='Disable FSD50K split filtering (use all clips for every split)')
     args = parser.parse_args()
 
-    output_dir = os.path.abspath(args.output_dir)
-    meta_dir   = os.path.join(output_dir, 'meta')
-    os.makedirs(meta_dir, exist_ok=True)
-
+    output_dir    = os.path.abspath(args.output_dir)
     max_sfx_files = args.max_sfx_files if args.max_sfx_files > 0 else None
+    os.makedirs(os.path.join(output_dir, 'meta'), exist_ok=True)
 
-    # ── Check / generate SFX ─────────────────────────────────────────────────
-    mp3_files = [f for f in os.listdir(SFX_DIR) if f.lower().endswith('.mp3')]
-    wav_files = [f for f in os.listdir(SFX_DIR) if f.lower().endswith('.wav')]
-    if not mp3_files and not wav_files:
-        print('[SFX] soud_effects/ directory is empty — generating synthetic tones.')
-        _generate_synthetic_tones(SFX_DIR, fs=48_000, duration=4.0)
+    # ── HRTF ─────────────────────────────────────────────────────────────────
+    print('[HRTF] Scanning SOFA files ...')
+    sofa_paths = scan_sofa_paths(args.hrtf_dir)
+    if not sofa_paths:
+        raise FileNotFoundError(f'No p*.sofa files in {args.hrtf_dir}')
+    fs = _read_sofa_fs(sofa_paths[0])
+    print(f'       {len(sofa_paths)} subjects, fs={fs} Hz')
 
-    # ── Scan HRTF + SFX paths (no audio loaded in main process) ──────────────
-    print('[SOFA] Loading HRTF ...')
-    hrir_l, hrir_r, azimuths, elevations, fs_hrtf = load_sofa(SOFA_PATH)
-    fs = int(fs_hrtf)
-    print(f'       {len(azimuths)} directions, fs={fs} Hz')
-
+    # ── SFX — per-split clip sets ─────────────────────────────────────────────
     print('[SFX]  Scanning sound effects ...')
-    sfx_paths = scan_sfx_paths(SFX_DIR)
-    print(f'       {len(sfx_paths)} clips found'
-          + (f' (workers will load up to {max_sfx_files} each)'
-             if max_sfx_files else ''))
+    gt_dir = args.fsd50k_gt_dir
 
-    class_map = build_class_map(sfx_paths)
+    use_split = (not args.no_split_sfx
+                 and os.path.isdir(gt_dir)
+                 and os.path.exists(os.path.join(gt_dir, 'dev.csv')))
 
-    # ── Save meta files ───────────────────────────────────────────────────────
-    class_map_path = os.path.join(meta_dir, 'class_map.json')
-    with open(class_map_path, 'w') as f:
+    if use_split:
+        sfx_paths_per_split = {
+            'train': scan_sfx_split_paths(args.sfx_dir, gt_dir, 'train'),
+            'val':   scan_sfx_split_paths(args.sfx_dir, gt_dir, 'val'),
+            'test':  scan_sfx_split_paths(args.sfx_dir, gt_dir, 'test'),
+        }
+        for sp, paths in sfx_paths_per_split.items():
+            print(f'       {sp:5s}: {len(paths):6,} clips')
+    else:
+        print('       FSD50K ground-truth CSV not found — using all clips for every split')
+        all_paths = scan_sfx_paths(args.sfx_dir)
+        sfx_paths_per_split = {'train': all_paths, 'val': all_paths, 'test': all_paths}
+        print(f'       total: {len(all_paths):,} clips')
+
+    # Build unified class_map from all clips so IDs are consistent across splits
+    all_sfx_paths = scan_sfx_paths(args.sfx_dir)
+    if not all_sfx_paths:
+        print('[SFX]  soud_effects/ is empty — generating synthetic tones.')
+        _generate_synthetic_tones(args.sfx_dir, fs=fs, duration=4.0)
+        all_sfx_paths = scan_sfx_paths(args.sfx_dir)
+        sfx_paths_per_split = {'train': all_sfx_paths,
+                                'val':   all_sfx_paths,
+                                'test':  all_sfx_paths}
+    class_map = build_class_map(all_sfx_paths)
+
+    # ── SRIR ─────────────────────────────────────────────────────────────────
+    print(f'[SRIR] train rooms ({len(SRIR_TRAIN_ROOMS)}): {SRIR_TRAIN_ROOMS}')
+    print(f'       eval  rooms ({len(SRIR_EVAL_ROOMS)}): {SRIR_EVAL_ROOMS}')
+
+    # ── Meta files ────────────────────────────────────────────────────────────
+    meta_dir = os.path.join(output_dir, 'meta')
+    with open(os.path.join(meta_dir, 'class_map.json'), 'w') as f:
         json.dump(class_map, f, indent=2)
-    print(f'[META] class_map → {class_map_path}')
 
-    split_meta = {
-        'train': {
-            'n_scenes'  : args.num_train,
-            'base_id'   : SPLIT_OFFSETS['train'],
-            'audio_dir' : os.path.join(output_dir, 'audio', 'train'),
-            'anno_dir'  : os.path.join(output_dir, 'annotations', 'train'),
-        },
-        'val': {
-            'n_scenes'  : args.num_val,
-            'base_id'   : SPLIT_OFFSETS['val'],
-            'audio_dir' : os.path.join(output_dir, 'audio', 'val'),
-            'anno_dir'  : os.path.join(output_dir, 'annotations', 'val'),
-        },
-        'test': {
-            'n_scenes'  : args.num_test,
-            'base_id'   : SPLIT_OFFSETS['test'],
-            'audio_dir' : os.path.join(output_dir, 'audio', 'test'),
-            'anno_dir'  : os.path.join(output_dir, 'annotations', 'test'),
-        },
+    split_cfg = {
+        sp: {
+            'n_scenes' : getattr(args, f'num_{sp}'),
+            'base_id'  : SPLIT_OFFSETS[sp],
+            'srir_rooms': _SRIR_ROOMS_PER_SPLIT[sp],
+            'audio_dir': os.path.join(output_dir, 'audio', sp),
+            'anno_dir' : os.path.join(output_dir, 'annotations', sp),
+        }
+        for sp in ('train', 'val', 'test')
     }
-    split_meta_path = os.path.join(meta_dir, 'split.json')
-    with open(split_meta_path, 'w') as f:
-        json.dump(split_meta, f, indent=2)
-    print(f'[META] split.json → {split_meta_path}')
+    with open(os.path.join(meta_dir, 'split.json'), 'w') as f:
+        json.dump(split_cfg, f, indent=2)
+    print(f'[META] Written to {meta_dir}/')
 
     # ── Build splits ──────────────────────────────────────────────────────────
-    for split, n in [('train', args.num_train),
-                     ('val',   args.num_val),
-                     ('test',  args.num_test)]:
+    for split in ('train', 'val', 'test'):
+        n = getattr(args, f'num_{split}')
         print(f'\n[BUILD] {split} ({n} scenes) ...')
-        _build_split(split, n, output_dir, args.workers, args.seed, args.resume,
-                     sfx_paths, class_map, max_sfx_files)
+        _build_split(
+            split        = split,
+            n_scenes     = n,
+            output_dir   = output_dir,
+            workers      = args.workers,
+            seed         = args.seed,
+            resume       = args.resume,
+            sofa_paths   = sofa_paths,
+            sfx_paths    = sfx_paths_per_split[split],
+            class_map    = class_map,
+            max_sfx_files= max_sfx_files,
+            srir_dir     = args.srir_dir,
+            srir_rooms   = _SRIR_ROOMS_PER_SPLIT[split],
+            fs           = fs,
+        )
 
     print('\nDataset build complete.')
 

@@ -13,15 +13,27 @@ Components
       Generates DN queries from GT labels (training only).
       Fixed: per-frame class shuffle for negatives (was all-frames same perm).
 
-  DecoderLayer
-      self-attn + cross-attn + FFN (post-norm).
+  SpatialBeamformingMemory
+      Creates 72 direction-aware memory tokens from a fixed azimuth×elevation
+      grid.  Spatial queries cross-attend to the encoder output, producing
+      direction-specific features that give the decoder explicit spatial context.
+
+  SlotCompetitionLayer
+      self-attn → spatial cross-attn → freq cross-attn → FFN (post-norm).
+      Replaces DecoderLayer.  Slots first attend to the spatial-memory tokens
+      (direction grid) then to the 7 frequency-scale tokens from the encoder.
+      Inter-slot self-attention creates competition so slots cannot all collapse
+      to the same direction.
 
   IterativeRefinementDecoder
       Replaces LookForwardTwiceDecoder.
       After each layer predicts a rough DOA unit vector from matching queries
       and injects it as a learned positional embedding into the next layer,
       giving true iterative geometric refinement.
+      Now accepts both freq_memory (7 tokens) and spatial_memory (72 tokens).
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -196,49 +208,182 @@ class ContrastiveDeNoising(nn.Module):
 
 
 # =============================================================================
-# DecoderLayer
+# SpatialBeamformingMemory
 # =============================================================================
 
-class DecoderLayer(nn.Module):
-    """Single decoder layer: self-attention → cross-attention → FFN (post-norm)."""
+class SpatialBeamformingMemory(nn.Module):
+    """Fixed angular grid → spatial tokens that fuse with encoder output.
+
+    Builds 72 unit vectors on a sphere (36 az × 2 el) as a fixed directional
+    grid, projects them to d_model, and cross-attends each frame's encoder
+    representation.  The resulting tokens carry both directional identity and
+    scene-specific acoustic information, giving the decoder an explicit spatial
+    compass for multi-source localisation.
+
+    Parameters
+    ----------
+    d_model : int   feature dimension (256)
+    n_az    : int   azimuth bins (36 → 10° resolution)
+    n_el    : int   elevation bins (2 → ±30°)
+    n_heads : int   attention heads
+    """
+
+    def __init__(self, d_model: int = 256, n_az: int = 36, n_el: int = 2,
+                 n_heads: int = 8):
+        super().__init__()
+        self.n_dirs = n_az * n_el
+
+        # ── Build fixed angular grid ──────────────────────────────────────────
+        # Azimuths: 0, 10, 20, …, 350 degrees (uniform ring)
+        # Elevations: −30°, +30°
+        azimuths   = [2 * math.pi * i / n_az for i in range(n_az)]
+        elevations = [-30.0 * math.pi / 180.0, 30.0 * math.pi / 180.0]
+
+        dirs = []
+        for el in elevations:
+            for az in azimuths:
+                x = math.cos(el) * math.cos(az)
+                y = math.cos(el) * math.sin(az)
+                z = math.sin(el)
+                dirs.append([x, y, z])
+
+        direction_grid = torch.tensor(dirs, dtype=torch.float32)  # [n_dirs, 3]
+        self.register_buffer('direction_grid', direction_grid)
+
+        # ── Spatial projection: direction → d_model ───────────────────────────
+        self.spatial_proj = nn.Sequential(
+            nn.Linear(3, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        # ── Fusion: spatial tokens cross-attend encoder output ────────────────
+        self.fusion_attn = nn.MultiheadAttention(
+            d_model, n_heads, batch_first=True
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, enc_out: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        enc_out : [B, T, d]   encoder summary per frame
+
+        Returns
+        -------
+        [B*T, n_dirs, d]   direction-aware spatial memory tokens
+        """
+        B, T, d = enc_out.shape
+        BT = B * T
+
+        # Project direction grid → [n_dirs, d] → [B*T, n_dirs, d]
+        spatial_q = self.spatial_proj(self.direction_grid)            # [n_dirs, d]
+        spatial_q = spatial_q.unsqueeze(0).expand(BT, -1, -1)        # [B*T, n_dirs, d]
+
+        # KV: each frame's encoder output  [B*T, 1, d]
+        enc_flat = enc_out.reshape(BT, 1, d)
+
+        # Cross-attend: spatial directions query encoder summary per frame
+        attn_out, _ = self.fusion_attn(spatial_q, enc_flat, enc_flat,
+                                       need_weights=False)
+        spatial_tokens = self.norm(spatial_q + attn_out)              # [B*T, n_dirs, d]
+
+        return spatial_tokens
+
+
+# =============================================================================
+# SlotCompetitionLayer  (replaces DecoderLayer)
+# =============================================================================
+
+class SlotCompetitionLayer(nn.Module):
+    """Single decoder layer with dual-memory cross-attention.
+
+    Processing order (post-norm):
+      1. self-attn          — inter-slot competition; slots influence each other
+      2. spatial cross-attn — Q=slots, KV=spatial_memory (72 direction tokens)
+      3. freq cross-attn    — Q=slots, KV=freq_memory   (7 scale tokens)
+      4. FFN
+
+    The explicit inter-slot self-attention forces diversity: once one slot
+    attends heavily to a spatial direction the other slots see that and are
+    discouraged from attending the same way.
+    """
 
     def __init__(self, d_model: int = 256, n_heads: int = 8,
-                 ffn_dim: int = 512, dropout: float = 0.1):
+                 ffn_dim: int = 1024, dropout: float = 0.1):
         super().__init__()
 
+        # 1. inter-slot self-attention
         self.self_attn = nn.MultiheadAttention(d_model, n_heads,
                                                dropout=dropout,
                                                batch_first=True)
-        self.norm1     = nn.LayerNorm(d_model)
-        self.drop1     = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.drop1 = nn.Dropout(dropout)
 
-        self.cross_attn = nn.MultiheadAttention(d_model, n_heads,
-                                                dropout=dropout,
-                                                batch_first=True)
-        self.norm2      = nn.LayerNorm(d_model)
-        self.drop2      = nn.Dropout(dropout)
+        # 2. spatial cross-attention
+        self.spatial_cross_attn = nn.MultiheadAttention(d_model, n_heads,
+                                                        dropout=dropout,
+                                                        batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop2 = nn.Dropout(dropout)
 
-        self.ffn   = nn.Sequential(
+        # 3. frequency cross-attention
+        self.freq_cross_attn = nn.MultiheadAttention(d_model, n_heads,
+                                                     dropout=dropout,
+                                                     batch_first=True)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.drop3 = nn.Dropout(dropout)
+
+        # 4. FFN
+        self.ffn = nn.Sequential(
             nn.Linear(d_model, ffn_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(ffn_dim, d_model),
             nn.Dropout(dropout),
         )
-        self.norm3 = nn.LayerNorm(d_model)
+        self.norm4 = nn.LayerNorm(d_model)
 
-    def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
-                self_attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        sa_out, _ = self.self_attn(tgt, tgt, tgt,
+    def forward(self, slots: torch.Tensor,
+                freq_memory: torch.Tensor,
+                spatial_memory: torch.Tensor,
+                self_attn_mask: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        slots          : [B*T, S_total, d]
+        freq_memory    : [B*T, 7, d]
+        spatial_memory : [B*T, n_dirs, d]
+        self_attn_mask : [S_total, S_total] or None
+
+        Returns
+        -------
+        slots            : [B*T, S_total, d]
+        spatial_weights  : [B*T, S_total, n_dirs]  (for optional diagnostics)
+        """
+        # 1. inter-slot self-attention
+        sa_out, _ = self.self_attn(slots, slots, slots,
                                    attn_mask=self_attn_mask,
                                    need_weights=False)
-        tgt = self.norm1(tgt + self.drop1(sa_out))
+        slots = self.norm1(slots + self.drop1(sa_out))
 
-        ca_out, _ = self.cross_attn(tgt, memory, memory, need_weights=False)
-        tgt = self.norm2(tgt + self.drop2(ca_out))
+        # 2. spatial cross-attention
+        spa_out, spa_weights = self.spatial_cross_attn(
+            slots, spatial_memory, spatial_memory, need_weights=True
+        )
+        slots = self.norm2(slots + self.drop2(spa_out))
 
-        tgt = self.norm3(tgt + self.ffn(tgt))
-        return tgt
+        # 3. frequency cross-attention
+        freq_out, _ = self.freq_cross_attn(
+            slots, freq_memory, freq_memory, need_weights=False
+        )
+        slots = self.norm3(slots + self.drop3(freq_out))
+
+        # 4. FFN
+        slots = self.norm4(slots + self.ffn(slots))
+
+        return slots, spa_weights   # spa_weights: [B*T, S_total, n_dirs]
 
 
 # =============================================================================
@@ -248,20 +393,17 @@ class DecoderLayer(nn.Module):
 class IterativeRefinementDecoder(nn.Module):
     """Decoder with iterative DOA-based positional refinement.
 
-    Replaces LookForwardTwiceDecoder.
+    Each layer is a SlotCompetitionLayer that attends to both a spatial memory
+    (72 direction-aware tokens) and a frequency memory (7 multi-scale tokens).
+    After each intermediate layer a lightweight head predicts a rough DOA vector
+    from matching queries and injects it as a positional embedding into the next
+    layer for iterative geometric correction.
 
-    After each layer i (except the last), a lightweight head predicts a rough
-    DOA unit vector from the matching query embeddings.  That vector is encoded
-    as a learned positional embedding and added to the matching queries before
-    layer i+1.  This gives the decoder an explicit geometric feedback signal
-    that steers each slot toward the correct direction.
-
-    DN queries (slots S..S_total) are untouched by the refinement — they are
-    supervised separately and do not need iterative positional correction.
+    DN queries (slots S..S_total) are untouched by refinement.
 
     Returns
     -------
-    list of n_layers tensors [B*T, S_total, d] — one per layer
+    list of n_layers tensors [B*T, S_total, d]
     """
 
     def __init__(self, d_model: int = 256, n_heads: int = 8,
@@ -272,7 +414,9 @@ class IterativeRefinementDecoder(nn.Module):
         self.n_layers = n_layers
 
         self.layers = nn.ModuleList([
-            DecoderLayer(d_model, n_heads, ffn_dim=d_model * 2, dropout=dropout)
+            SlotCompetitionLayer(d_model, n_heads,
+                                 ffn_dim=d_model * 4,
+                                 dropout=dropout)
             for _ in range(n_layers)
         ])
 
@@ -294,14 +438,17 @@ class IterativeRefinementDecoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-    def forward(self, queries: torch.Tensor, memory: torch.Tensor,
+    def forward(self, queries: torch.Tensor,
+                freq_memory: torch.Tensor,
+                spatial_memory: torch.Tensor,
                 attn_mask: torch.Tensor | None = None) -> list:
         """
         Parameters
         ----------
-        queries   : [B*T, S_total, d]   initial queries (matching + optional DN)
-        memory    : [B*T, M, d]         encoder memory (M=7 multi-scale tokens)
-        attn_mask : [S_total, S_total]  or None
+        queries        : [B*T, S_total, d]   initial queries (matching + optional DN)
+        freq_memory    : [B*T, 7, d]         encoder multi-scale memory
+        spatial_memory : [B*T, n_dirs, d]    direction-aware spatial memory
+        attn_mask      : [S_total, S_total]  or None
 
         Returns
         -------
@@ -312,7 +459,8 @@ class IterativeRefinementDecoder(nn.Module):
         S = self.n_slots
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, memory, self_attn_mask=attn_mask)
+            x, _ = layer(x, freq_memory, spatial_memory,
+                         self_attn_mask=attn_mask)
             outputs.append(x)
 
             if i < self.n_layers - 1:

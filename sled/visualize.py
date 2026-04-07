@@ -212,12 +212,18 @@ def load_gt_per_frame(json_path: str, n_frames: int,
                     label = events[s].get('source_event', label)
                 active.append({'azimuth': az, 'elevation': el, 'label': label})
         else:
-            # Original format: fixed azimuth/elevation per event
+            # Original format: fixed azimuth/elevation per event.
+            # Convention detection:
+            #   Old synthesizer → SOFA CCW, event has 'az_idx' key → negate to SLED CW
+            #   New synthesizer → SLED CW already, no 'az_idx'     → use directly
             frame_start = t * HOP_SAMPLES
             frame_end   = frame_start + HOP_SAMPLES
             for ev in events:
                 if ev['start_sample'] < frame_end and ev['end_sample'] > frame_start:
-                    az_sled = (-ev['azimuth']) % 360.0
+                    if 'az_idx' in ev:
+                        az_sled = (-ev['azimuth']) % 360.0   # SOFA CCW → SLED CW
+                    else:
+                        az_sled = ev['azimuth'] % 360.0      # already SLED CW
                     key     = ev['file']
                     parts   = key.split('/', 1)
                     label   = parts[0] if len(parts) == 2 else os.path.splitext(parts[0])[0]

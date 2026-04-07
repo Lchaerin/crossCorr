@@ -35,8 +35,9 @@ _ROOT = os.path.join(_HERE, '..')
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from sled.dataset.torch_dataset import build_dataloader
+from sled.dataset.torch_dataset import build_dataloader, build_mixed_dataloader
 from sled.model.sled            import SLEDv3
+from sled.model.losses          import SlotDiversityLoss
 
 
 # =============================================================================
@@ -204,7 +205,11 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
 
     presence_loss = F.binary_cross_entropy_with_logits(conf_flat, conf_tgt)
 
-    return cls_loss + doa_loss + presence_loss
+    # DOA weight 2× relative to classification
+    return cls_loss + 2.0 * doa_loss + presence_loss
+
+
+_diversity_loss_fn = SlotDiversityLoss()
 
 
 def compute_losses(layer_preds: list, gt: dict,
@@ -297,6 +302,18 @@ def compute_losses(layer_preds: list, gt: dict,
             )
             total_loss = total_loss + w * 0.5 * (dn_loss + neg_conf_loss)
 
+    # ── Slot diversity loss on the last layer (λ=0.5) ─────────────────────────
+    # Penalises active slots predicting similar DOA directions.
+    # Applied once (last layer) to avoid over-regularising early layers.
+    last_pred = layer_preds[-1]
+    doa_last  = last_pred['doa_vec']          # [B, T, S, 3]
+    mask_div  = gt['mask']                    # [B, T, S] bool
+
+    # T-alignment guard
+    T_d   = min(doa_last.shape[1], mask_div.shape[1])
+    div   = _diversity_loss_fn(doa_last[:, :T_d], mask_div[:, :T_d])
+    total_loss = total_loss + 0.5 * div
+
     return total_loss
 
 
@@ -384,7 +401,21 @@ def main():
         description='Train SLED v3.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--dataset-root',   default='./data_custom_hrtf')
+    parser.add_argument('--dataset-root',   default='./data_custom_hrtf',
+                        help='1번 데이터셋 경로 (단독 사용 또는 혼합 기준)')
+    parser.add_argument('--dataset-root2',  default=None,
+                        help='2번 데이터셋 경로 (지정 시 혼합 학습 활성화)')
+    parser.add_argument('--mix-ratio',      type=float, nargs=2,
+                        default=None, metavar=('W1', 'W2'),
+                        help='각 데이터셋의 샘플링 비율 (예: --mix-ratio 0.7 0.3). '
+                             '합계가 1일 필요 없음(자동 정규화).')
+    parser.add_argument('--val-mix-ratio',  type=float, nargs=2, default=None,
+                        metavar=('VW1', 'VW2'),
+                        help='val용 데이터셋 비율. 생략 시 --mix-ratio와 동일.')
+    parser.add_argument('--val-size',       type=int, default=None,
+                        help='val 에폭당 총 샘플 수. 생략 시 두 데이터셋 합계.')
+    parser.add_argument('--epoch-size',     type=int, default=None,
+                        help='train 에폭당 총 샘플 수. 생략 시 데이터셋 전체 크기.')
     parser.add_argument('--sofa-path',      default='./hrtf/custom_mrs.sofa')
     parser.add_argument('--epochs',         type=int,   default=200)
     parser.add_argument('--batch-size',     type=int,   default=64)
@@ -454,29 +485,74 @@ def main():
         print(f'         Resuming from epoch {start_epoch}')
 
     # ── DataLoaders ───────────────────────────────────────────────────────────
-    dataset_root = os.path.abspath(args.dataset_root)
-    print(f'[DATA] Loading from {dataset_root}')
     use_pin = (device.type == torch.device('cuda').type if hasattr(device, 'type') else str(device).startswith('cuda'))
-    train_loader = build_dataloader(
-        dataset_root    = dataset_root,
-        split           = 'train',
-        batch_size      = args.batch_size,
-        window_frames   = args.window_frames,
-        augment_scs     = True,
-        num_workers     = args.workers,
-        pin_memory      = use_pin,
-        min_loudness_db = args.min_loudness_db,
-    )
-    val_loader = build_dataloader(
-        dataset_root    = dataset_root,
-        split           = 'val',
-        batch_size      = args.batch_size,
-        window_frames   = args.window_frames,
-        augment_scs     = False,
-        num_workers     = args.workers,
-        pin_memory      = use_pin,
-        min_loudness_db = args.min_loudness_db,
-    )
+
+    if args.dataset_root2 is not None:
+        # ── 혼합 학습 ────────────────────────────────────────────────────────
+        w1, w2 = args.mix_ratio if args.mix_ratio else (1.0, 1.0)
+        configs = [
+            {'root': os.path.abspath(args.dataset_root),  'weight': w1},
+            {'root': os.path.abspath(args.dataset_root2), 'weight': w2},
+        ]
+        print(f'[DATA] Mixed training:')
+        print(f'       dataset1: {configs[0]["root"]}  weight={w1}')
+        print(f'       dataset2: {configs[1]["root"]}  weight={w2}')
+        vw1, vw2 = args.val_mix_ratio if args.val_mix_ratio else (w1, w2)
+        val_configs = [
+            {'root': os.path.abspath(args.dataset_root),  'weight': vw1},
+            {'root': os.path.abspath(args.dataset_root2), 'weight': vw2},
+        ]
+        print(f'       train ratio: {w1}:{w2}  |  val ratio: {vw1}:{vw2}')
+        if args.val_size:
+            print(f'       val_size: {args.val_size}')
+        train_loader = build_mixed_dataloader(
+            dataset_configs = configs,
+            split           = 'train',
+            batch_size      = args.batch_size,
+            window_frames   = args.window_frames,
+            augment_scs     = True,
+            num_workers     = args.workers,
+            pin_memory      = use_pin,
+            min_loudness_db = args.min_loudness_db,
+            epoch_size      = args.epoch_size,
+        )
+        val_loader = build_mixed_dataloader(
+            dataset_configs = val_configs,
+            split           = 'val',
+            batch_size      = args.batch_size,
+            window_frames   = args.window_frames,
+            augment_scs     = False,
+            num_workers     = args.workers,
+            pin_memory      = use_pin,
+            min_loudness_db = args.min_loudness_db,
+            val_size        = args.val_size,
+        )
+    else:
+        # ── 단일 데이터셋 ────────────────────────────────────────────────────
+        dataset_root = os.path.abspath(args.dataset_root)
+        print(f'[DATA] Loading from {dataset_root}')
+        train_loader = build_dataloader(
+            dataset_root    = dataset_root,
+            split           = 'train',
+            batch_size      = args.batch_size,
+            window_frames   = args.window_frames,
+            augment_scs     = True,
+            num_workers     = args.workers,
+            pin_memory      = use_pin,
+            min_loudness_db = args.min_loudness_db,
+            epoch_size      = args.epoch_size,
+        )
+        val_loader = build_dataloader(
+            dataset_root    = dataset_root,
+            split           = 'val',
+            batch_size      = args.batch_size,
+            window_frames   = args.window_frames,
+            augment_scs     = False,
+            num_workers     = args.workers,
+            pin_memory      = use_pin,
+            min_loudness_db = args.min_loudness_db,
+        )
+
     print(f'       Train: {len(train_loader.dataset)} scenes | '
           f'Val: {len(val_loader.dataset)} scenes')
 

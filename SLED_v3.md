@@ -223,13 +223,17 @@ no-object (N+1 class)           Separate Presence Head (BCE)
             │CrossAttentionQuery    │  slot params(Q) → 7 tokens(KV)
             │Selector               │  (fully differentiable)
             └────────┬──────────────┘
-                     │  queries [B*T, 3, d]   ← matching queries
-                     │  memory  [B*T, 7, d]   ← 7 multi-scale tokens
-                     │  (학습 시: DN 쿼리 concat + self-attn mask)
-            ┌────────▼────────────────┐
-            │ IterativeRefinement     │  self-attn + cross-attn(7)
-            │ Decoder × 4            │  + DOA positional feedback/layer
-            └────────┬────────────────┘
+                     │  queries      [B*T, 3, d]
+                     │  freq_memory  [B*T, 7, d]   ← 7 multi-scale tokens
+                     │                             ┌──────────────────────┐
+                     │  spatial_mem  [B*T, 72, d] ←│SpatialBeamforming    │
+                     │                             │Memory (36az × 2el)   │
+                     │  (학습 시: DN 쿼리 concat + self-attn mask)         │
+            ┌────────▼────────────────┐            └──────────────────────┘
+            │ IterativeRefinement     │  self-attn (슬롯 경쟁)
+            │ Decoder × 4            │  + spatial cross-attn(72)
+            │ (SlotCompetitionLayer) │  + freq cross-attn(7)
+            └────────┬────────────────┘  + DOA positional feedback/layer
                      │  4개 레이어 각각 출력 저장
             ┌────────▼────────┐
             │ DetectionHeads  │  class / DOA / loudness / presence
@@ -696,11 +700,14 @@ DINO의 CDN을 구면 DOA 공간으로 이식:
 
 ### 8.3 IterativeRefinementDecoder
 
-DINO의 박스 delta 정밀화를 DOA 단위벡터 정밀화로 대응:
+DINO의 박스 delta 정밀화를 DOA 단위벡터 정밀화로 대응.  
+이제 `freq_memory`(7토큰)와 `spatial_memory`(72토큰) 두 메모리를 모두 받는다:
 
 ```
 for each layer i in [0..3]:
-    x = DecoderLayer(x, memory=7_tokens)   → [B*T, S_total, d]
+    x, _ = SlotCompetitionLayer(x,
+                                freq_memory   = [B*T, 7, d],
+                                spatial_memory= [B*T, 72, d])
     저장: layer_preds[i]
 
     if i < last_layer:
@@ -713,16 +720,47 @@ for each layer i in [0..3]:
 
 레이어별 DOA 위치 피드백이 실제 기하학적 정보를 전달하여 점진적 정밀화를 가능하게 한다.
 
-### 8.4 DecoderLayer
+### 8.4 SlotCompetitionLayer  _(구 DecoderLayer 대체)_
+
+다중 음원 탐지 성능 향상을 위해 단순 cross-attn(1개) → **3단계 처리**로 확장:
 
 ```
-x [B*T, S, d]      ← 쿼리
-mem [B*T, 7, d]    ← 7 multi-scale 토큰
+x [B*T, S_total, d]
 
-Self-attention   (S×S, + attn_mask for DN isolation) → post-norm
-Cross-attention  (Q=x, KV=mem, 7개 토큰)              → post-norm
-FFN (GELU)                                             → post-norm
+1. Self-attention   (S×S, + DN isolation mask)            → post-norm
+   ↑ 슬롯 간 경쟁: 한 슬롯이 방향 A를 선택하면 다른 슬롯이 인식
+
+2. Spatial cross-attn  (Q=x, KV=spatial_memory [72, d])   → post-norm
+   ↑ 방향 격자 72개에서 현재 방향 정보 집계
+
+3. Freq cross-attn     (Q=x, KV=freq_memory [7, d])       → post-norm
+   ↑ 주파수 스케일별 음색 정보 집계
+
+4. FFN (GELU, dim=d_model×4)                              → post-norm
 ```
+
+spatial_attn_weights `[B*T, S_total, 72]`도 반환 (진단 용도).
+
+### 8.5 SpatialBeamformingMemory  _(신규)_
+
+고정 방향 격자(36az × 2el = **72 방향**)를 방향-인식 토큰으로 변환:
+
+```
+direction_grid [72, 3]   ← 고정 단위벡터 (register_buffer)
+   az: 0°, 10°, …, 350°  (36개)
+   el: −30°, +30°         (2개)
+
+spatial_proj: Linear(3→d) + GELU + Linear(d→d)
+   → [72, d]   방향 임베딩
+
+fusion_attn: MHA(Q=spatial_queries, KV=enc_out)
+   → 각 방향 토큰이 해당 프레임 인코더 출력에 cross-attend
+
+출력: [B*T, 72, d]   프레임별 방향-인식 메모리
+```
+
+이 토큰은 SlotCompetitionLayer의 spatial cross-attn 메모리(KV)로 사용된다.  
+슬롯은 72개 방향 중 어느 방향에 얼마나 주목할지를 명시적으로 학습한다.
 
 ---
 
@@ -771,6 +809,8 @@ focal = α(1−p_t)^γ · BCE(logits, one_hot(target))
 ```
 doa_loss = 1 − cos_sim(pred_doa, gt_doa)   ∈ [0, 2]
 ```
+> **가중치 2.0×** — 분류 대비 DOA 오차에 더 강한 그래디언트 신호를 부여.  
+> 단일 음원에서는 이미 잘 수렴하므로 다중 음원 분리에 초점.
 
 #### Presence Loss
 ```
@@ -778,13 +818,27 @@ conf_target = 1.0 (매칭된 슬롯) | 0.0 (비매칭)
 presence_loss = BCE(conf_logit, conf_target)
 ```
 
+#### SlotDiversityLoss  _(신규, `sled/model/losses.py`)_
+```
+active 슬롯 쌍 (i, j)에 대해 cos_sim(pred_doa_i, pred_doa_j) 페널티:
+
+diversity_loss = mean over active (i,j) pairs of
+                 clamp(cos_sim(doa_i, doa_j), min=0)
+```
+두 슬롯이 같은 방향을 가리키면 큰 값 → 반발력(repulsion) 효과.  
+GT mask가 모두 True인 쌍에만 적용 → 실제 다중 음원 프레임에서만 작동.
+
 ### 10.3 전체 Loss 조합
 
 ```
+layer_loss(pred, gt) = focal(cls) + 2.0 × doa + presence
+
 total_loss = Σ_i  w_i × layer_loss(matching_preds_i, gt)
            + Σ_i  w_i × 0.5 × dn_loss(dn_preds_i, dn_targets)
+           + 0.5 × diversity_loss(last_layer_doa, gt_mask)
 
 layer weights = [0.2, 0.4, 0.6, 1.0]   (깊은 레이어 가중치 높음)
+diversity_loss: 마지막 레이어 예측에만 1회 적용 (λ=0.5)
 
 dn_loss = pos_loss + neg_conf_loss
   pos_loss     : positive DN → focal + doa + presence
@@ -1103,8 +1157,10 @@ crossCorr/
     │   ├── preprocessor.py      AudioPreprocessor (use_ild, use_ipd, use_hrtf_corr)
     │   ├── encoder.py           SLEDEncoder, HRTFProjection (조건부), CausalBiFPN
     │   ├── decoder.py           CrossAttentionQuerySelector, ContrastiveDeNoising,
+    │   │                        SpatialBeamformingMemory, SlotCompetitionLayer,
     │   │                        IterativeRefinementDecoder
     │   ├── heads.py             DetectionHeads
+    │   ├── losses.py            SlotDiversityLoss (다중 음원 슬롯 분산 페널티)
     │   └── sled.py              SLEDv3 (use_ild, use_ipd, use_hrtf_corr 플래그)
     ├── dataset/
     │   ├── synthesizer.py       씬 합성기 (합성 데이터셋용)
@@ -1137,3 +1193,8 @@ crossCorr/
 | `use_ild` | True | ILD 채널 사용 여부 (ablation) |
 | `use_ipd` | True | IPD 채널 사용 여부 (ablation) |
 | `use_hrtf_corr` | True | HRTF 히트맵 사용 여부 (ablation) |
+| **디코더 FFN dim** | **d_model × 4** | SlotCompetitionLayer FFN 폭 (구: d_model×2) |
+| **공간 격자 n_az** | **36** | SpatialBeamformingMemory 방위각 분할 수 |
+| **공간 격자 n_el** | **2** | SpatialBeamformingMemory 고도각 분할 수 (±30°) |
+| **DOA loss weight** | **2.0** | 분류 대비 DOA 손실 가중치 |
+| **diversity λ** | **0.5** | SlotDiversityLoss 가중치 |

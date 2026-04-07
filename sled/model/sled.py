@@ -25,6 +25,7 @@ from .decoder      import (
     CrossAttentionQuerySelector,
     ContrastiveDeNoising,
     IterativeRefinementDecoder,
+    SpatialBeamformingMemory,
 )
 from .heads        import DetectionHeads
 
@@ -86,6 +87,7 @@ class SLEDv3(nn.Module):
             n_classes   = n_classes,
             n_dn_groups = 3,
         )
+        self.spatial_memory = SpatialBeamformingMemory(d_model)
         self.decoder = IterativeRefinementDecoder(
             d_model  = d_model,
             n_layers = n_decoder_layers,
@@ -163,9 +165,11 @@ class SLEDv3(nn.Module):
         # Fully differentiable: learnable slots attend to 7 candidates.
         queries = self.query_selector(multi_scale)   # [B*T, S, d]
 
-        # ── Memory: all 7 multi-scale tokens (not just 1) ─────────────────────
-        # Gives the decoder rich multi-frequency context per frame.
-        memory = torch.stack(multi_scale, dim=2).reshape(B * T, 7, d)  # [B*T, 7, d]
+        # ── Frequency memory: 7 multi-scale tokens per frame ─────────────────
+        freq_memory = torch.stack(multi_scale, dim=2).reshape(B * T, 7, d)  # [B*T, 7, d]
+
+        # ── Spatial memory: 72 direction-aware tokens per frame ───────────────
+        spatial_mem = self.spatial_memory(enc_out)  # [B*T, 72, d]
 
         # ── Denoising (training only) ─────────────────────────────────────────
         S_dn      = 0
@@ -183,7 +187,9 @@ class SLEDv3(nn.Module):
             all_queries = queries
 
         # ── Decoder ───────────────────────────────────────────────────────────
-        all_layer_outputs = self.decoder(all_queries, memory, attn_mask)
+        all_layer_outputs = self.decoder(
+            all_queries, freq_memory, spatial_mem, attn_mask
+        )
         # List of n_layers × [B*T, S_total, d]
 
         # ── Detection heads for matching queries ─────────────────────────────

@@ -10,7 +10,7 @@ import sys
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
 
 # Make the package importable when run as a script
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -189,6 +189,95 @@ class SLEDDataset(Dataset):
 # DataLoader factory
 # =============================================================================
 
+def build_mixed_dataloader(
+    dataset_configs: list,
+    split: str,
+    batch_size: int = 8,
+    window_frames: int = 256,
+    augment_scs: bool = True,
+    num_workers: int = 4,
+    min_loudness_db: float = -60.0,
+    epoch_size: int | None = None,
+    val_size: int | None = None,
+    **kwargs,
+) -> DataLoader:
+    """여러 데이터셋을 비율에 따라 섞는 DataLoader.
+
+    Parameters
+    ----------
+    dataset_configs : list of dict
+        [{'root': './data_custom_hrtf', 'weight': 0.7},
+         {'root': './data_mrs_mix',     'weight': 0.3}]
+        weight는 정규화 불필요 (자동 처리).
+    epoch_size : int or None
+        train 에폭당 총 샘플 수. None이면 두 데이터셋 합계(N1+N2).
+    val_size : int or None
+        val/test 에폭당 총 샘플 수. None이면 두 데이터셋 합계(N1+N2).
+        가중치 비율에 따라 각 데이터셋에서 proportional하게 샘플링.
+    """
+    datasets = []
+    for cfg in dataset_configs:
+        ds = SLEDDataset(
+            dataset_root    = cfg['root'],
+            split           = split,
+            window_frames   = window_frames,
+            augment_scs     = augment_scs,
+            min_loudness_db = min_loudness_db,
+        )
+        datasets.append((ds, float(cfg.get('weight', 1.0))))
+
+    pin_memory = kwargs.pop('pin_memory', True)
+
+    weights_raw = [w for _, w in datasets]
+    total_w     = sum(weights_raw)
+    norm_w      = [w / total_w for w in weights_raw]
+
+    combined = ConcatDataset([ds for ds, _ in datasets])
+
+    sample_weights = []
+    for (ds, _), nw in zip(datasets, norm_w):
+        per_sample = nw / len(ds)
+        sample_weights.extend([per_sample] * len(ds))
+
+    if split == 'train':
+        n_samples = epoch_size if epoch_size is not None else len(combined)
+        sampler = WeightedRandomSampler(
+            weights     = sample_weights,
+            num_samples = n_samples,
+            replacement = True,
+        )
+        return DataLoader(
+            combined,
+            batch_size  = batch_size,
+            sampler     = sampler,
+            num_workers = num_workers,
+            pin_memory  = pin_memory,
+            drop_last   = True,
+            **kwargs,
+        )
+    else:
+        # val/test: 동일한 가중치 비율로 고정 seed 샘플링 (결정론적)
+        n_val = val_size if val_size is not None else len(combined)
+        n_val = min(n_val, len(combined))
+        g = torch.Generator()
+        g.manual_seed(0)
+        sampler = WeightedRandomSampler(
+            weights     = sample_weights,
+            num_samples = n_val,
+            replacement = False,
+            generator   = g,
+        )
+        return DataLoader(
+            combined,
+            batch_size  = batch_size,
+            sampler     = sampler,
+            num_workers = num_workers,
+            pin_memory  = pin_memory,
+            drop_last   = False,
+            **kwargs,
+        )
+
+
 def build_dataloader(
     dataset_root: str,
     split: str,
@@ -197,6 +286,7 @@ def build_dataloader(
     augment_scs: bool = True,
     num_workers: int = 4,
     min_loudness_db: float = -60.0,
+    epoch_size: int | None = None,
     **kwargs,
 ) -> DataLoader:
     """Build a DataLoader for the given split.
@@ -209,13 +299,14 @@ def build_dataloader(
     window_frames : frames per sample (256 × 20 ms = 5.12 s)
     augment_scs   : Stereo Channel Swap augmentation (train only)
     num_workers   : DataLoader worker count
+    epoch_size    : train 에폭당 샘플 수. None이면 데이터셋 전체.
     **kwargs      : forwarded to DataLoader
 
     Returns
     -------
     torch.utils.data.DataLoader
     """
-    shuffle = kwargs.pop('shuffle', split == 'train')
+    from torch.utils.data import RandomSampler
     dataset = SLEDDataset(
         dataset_root    = dataset_root,
         split           = split,
@@ -224,10 +315,23 @@ def build_dataloader(
         min_loudness_db = min_loudness_db,
     )
     pin_memory = kwargs.pop('pin_memory', True)
+    kwargs.pop('shuffle', None)  # sampler와 shuffle 동시 사용 방지
+
+    if split == 'train' and epoch_size is not None:
+        sampler = RandomSampler(dataset, replacement=True, num_samples=epoch_size)
+        return DataLoader(
+            dataset,
+            batch_size  = batch_size,
+            sampler     = sampler,
+            num_workers = num_workers,
+            pin_memory  = pin_memory,
+            drop_last   = True,
+            **kwargs,
+        )
     return DataLoader(
         dataset,
         batch_size  = batch_size,
-        shuffle     = shuffle,
+        shuffle     = (split == 'train'),
         num_workers = num_workers,
         pin_memory  = pin_memory,
         drop_last   = (split == 'train'),
