@@ -9,7 +9,7 @@ Architecture
   AudioPreprocessor        → feat [B, 5, 64, T],  hrtf_ch [B, 64, 32]
   SLEDEncoder              → (multi_scale_feats 7×[B,T,d],  enc_out [B,T,d])
   CrossAttentionQuerySelector → queries [B*T, S, d]
-  memory = stack(multi_scale) → [B*T, 7, d]   (7 meaningful tokens, not 1)
+  memory = stack(multi_scale) → [B*T, 11, d]   (11 meaningful tokens, not 1)
   ContrastiveDeNoising (training) → dn_queries
   IterativeRefinementDecoder → list of [B*T, S_total, d]
   DetectionHeads (per layer)
@@ -40,18 +40,18 @@ class SLEDv3(nn.Module):
     n_slots             : maximum simultaneous sources per frame (3)
     n_classes           : real sound classes only, no empty class (e.g. 209)
     n_decoder_layers    : number of IterativeRefinement decoder layers (4)
-    n_conformer_layers  : number of CausalConformerBlocks in encoder (4)
+    n_conformer_layers  : number of CausalConformerBlocks in encoder (6)
     precompute_features : if True, skip preprocessor (input must be [B,5,64,T])
     use_hrtf_corr       : if False, skip HRTF cross-corr heatmap (ablation)
     use_ild             : if False, drop ILD channel from input (ablation)
     use_ipd             : if False, drop IPD channels (sin/cos) from input (ablation)
     """
 
-    N_CANDIDATES = 7   # 6 sub-band + 1 enc_out
+    N_CANDIDATES = 11   # 10 sub-band + 1 enc_out
 
     def __init__(self, sofa_path: str, d_model: int = 256,
                  n_slots: int = 3, n_classes: int = 209,
-                 n_decoder_layers: int = 4, n_conformer_layers: int = 4,
+                 n_decoder_layers: int = 4, n_conformer_layers: int = 6,
                  precompute_features: bool = False,
                  use_hrtf_corr: bool = True,
                  use_ild: bool = True,
@@ -138,7 +138,7 @@ class SLEDv3(nn.Module):
         # ── Feature extraction ────────────────────────────────────────────────
         if audio_or_feat.dim() == 3 and not self.precompute_features:
             feat, hrtf_ch = self.preprocessor(audio_or_feat)
-            # feat: [B, 5, 64, T]   hrtf_ch: [B, 64, 32]
+            # feat: [B, 5, 64, T]   hrtf_ch: [B, T_stft, 64, 32]
         else:
             feat    = audio_or_feat
             hrtf_ch = None
@@ -147,7 +147,7 @@ class SLEDv3(nn.Module):
 
         # ── Encoder ──────────────────────────────────────────────────────────
         multi_scale, enc_out = self.encoder(feat, hrtf_ch)
-        # multi_scale : 7 × [B, T, d]
+        # multi_scale : 11 × [B, T, d]
         # enc_out     : [B, T, d]
 
         # ── T alignment (STFT may produce T+1 frames; must match GT length) ──
@@ -166,7 +166,7 @@ class SLEDv3(nn.Module):
         queries = self.query_selector(multi_scale)   # [B*T, S, d]
 
         # ── Frequency memory: 7 multi-scale tokens per frame ─────────────────
-        freq_memory = torch.stack(multi_scale, dim=2).reshape(B * T, 7, d)  # [B*T, 7, d]
+        freq_memory = torch.stack(multi_scale, dim=2).reshape(B * T, self.N_CANDIDATES, d)  # [B*T, 11, d]
 
         # ── Spatial memory: 72 direction-aware tokens per frame ───────────────
         spatial_mem = self.spatial_memory(enc_out)  # [B*T, 72, d]

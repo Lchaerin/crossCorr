@@ -1,18 +1,19 @@
 #!/home/rllab/anaconda3/bin/python
 """
-SLED v3 — Encoder
-==================
+SLED v3.1 — Encoder
+====================
 Input:  [B, 5, 64, T]   5-channel feature tensor from AudioPreprocessor
-        hrtf_ch [B, 64, 32]   fixed-size HRTF az×el heatmap
+        hrtf_ch [B, T_stft, 64, 32]   per-frame HRTF az×el heatmap
 Output: (multi_scale_feats, enc_out)
-  multi_scale_feats : list of [B, T, 256] tensors (7 candidates total)
+  multi_scale_feats : list of [B, T, 256] tensors (11 candidates total)
   enc_out           : [B, T, 256]
 
 Changes from v3 original
 ------------------------
   - BatchNorm → GroupNorm throughout (stable for small batches and streaming)
-  - HRTFProjection: input is now [B, 64, 32] (fixed size), output [B, d_model]
-    applied as a broadcast additive bias over the temporal axis (not temporal conv)
+  - HRTFProjection: input is now [B, T, 64, 32] (per-frame), 2D CNN-based
+    applied as per-frame additive bias (not global broadcast)
+  - _subband_pool: 2 bands → 4/4/2 bands = 10 sub-band tokens (was 6)
 """
 
 import torch
@@ -242,25 +243,48 @@ class CausalBiFPN(nn.Module):
 # =============================================================================
 
 class HRTFProjection(nn.Module):
-    """Maps fixed-size HRTF az×el heatmap [B, az_bins, el_bins] → [B, d_model].
+    """Maps per-frame HRTF heatmap [B, T, 64, 32] → [B, T, d_model].
 
-    Outputs a single global spatial embedding that is broadcast-added over the
-    temporal axis in SLEDEncoder.forward.  No more variable T_stft dependency.
+    Uses a small 2D CNN to preserve spatial structure before projecting.
     """
 
     def __init__(self, az_bins: int = 64, el_bins: int = 32, d_model: int = 256):
         super().__init__()
+        # 2D CNN: treats each frame's [64, 32] heatmap as a 1-channel image
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # → [32, 16]
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # → [16, 8]
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),                                 # → [1, 1]
+        )
         self.proj = nn.Sequential(
-            nn.Flatten(1),                          # [B, az*el]
-            nn.Linear(az_bins * el_bins, d_model),
+            nn.Linear(128, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
         )
 
     def forward(self, ch5: torch.Tensor) -> torch.Tensor:
-        # ch5: [B, az_bins, el_bins]
-        return self.proj(ch5)   # [B, d_model]
+        """
+        Parameters
+        ----------
+        ch5 : [B, T, 64, 32]  per-frame HRTF heatmap
+
+        Returns
+        -------
+        [B, T, d_model]
+        """
+        B, T, H, W = ch5.shape
+        x = ch5.reshape(B * T, 1, H, W)        # [B*T, 1, 64, 32]
+        x = self.cnn(x).squeeze(-1).squeeze(-1) # [B*T, 128]
+        x = self.proj(x)                         # [B*T, d_model]
+        return x.reshape(B, T, -1)               # [B, T, d_model]
 
 
 # =============================================================================
@@ -328,17 +352,28 @@ class SLEDEncoder(nn.Module):
             feats = bifpn(feats)
         P3, P4, P5 = feats
 
-        def _subband_pool(p: torch.Tensor):
+        def _subband_pool(p: torch.Tensor, n_bands: int = 4):
+            """Split frequency axis into n_bands and pool each."""
             F_dim = p.shape[2]
-            mid   = F_dim // 2
-            lo    = p[:, :, :mid, :].mean(dim=2).permute(0, 2, 1)
-            hi    = p[:, :, mid:, :].mean(dim=2).permute(0, 2, 1)
-            return lo, hi
+            bands = []
+            band_size = max(1, F_dim // n_bands)
+            for b in range(n_bands):
+                start = b * band_size
+                end = min((b + 1) * band_size, F_dim)
+                if start >= F_dim:
+                    break
+                band = p[:, :, start:end, :].mean(dim=2).permute(0, 2, 1)  # [B, T, d]
+                bands.append(band)
+            return bands
 
         ms_feats = []
-        for px in (P3, P4, P5):
-            lo, hi = _subband_pool(px)
-            ms_feats.extend([lo, hi])
+        # P3 (highest freq resolution) → 4 bands
+        # P4 → 4 bands
+        # P5 (lowest freq resolution) → 2 bands
+        for px, nb in [(P3, 4), (P4, 4), (P5, 2)]:
+            bands = _subband_pool(px, n_bands=nb)
+            ms_feats.extend(bands)
+        # ms_feats: 4 + 4 + 2 = 10 sub-band tokens
 
         B, d, F5, T = P5.shape
         p5_flat = P5.reshape(B, d * F5, T)
@@ -348,12 +383,23 @@ class SLEDEncoder(nn.Module):
         for conformer in self.conformers:
             x = conformer(x)
 
-        # HRTF: global spatial bias broadcast over temporal axis
+        # HRTF: per-frame spatial injection
         if hrtf_ch is not None:
-            hrtf_feat = self.hrtf_proj(hrtf_ch)   # [B, d]
-            x = x + hrtf_feat.unsqueeze(1)          # [B, T, d]
+            B = x.shape[0]
+            # hrtf_ch: [B, T_stft, 64, 32] — T_stft may differ from T after conv
+            # Align temporal dimension to match encoder output T
+            T_enc = x.shape[1]
+            if hrtf_ch.shape[1] != T_enc:
+                # Linear interpolate along time axis
+                hrtf_ch = hrtf_ch.permute(0, 2, 3, 1)  # [B, 64, 32, T_stft]
+                hrtf_ch = F.interpolate(
+                    hrtf_ch.reshape(B, 64 * 32, -1),    # [B, 2048, T_stft]
+                    size=T_enc, mode='nearest'
+                ).reshape(B, 64, 32, T_enc).permute(0, 3, 1, 2)  # [B, T_enc, 64, 32]
+            hrtf_feat = self.hrtf_proj(hrtf_ch)   # [B, T, d]
+            x = x + hrtf_feat                      # [B, T, d]  (per-frame addition)
 
         enc_out = x
-        ms_feats.append(enc_out)   # 7th candidate
+        ms_feats.append(enc_out)   # 11th candidate
 
         return ms_feats, enc_out

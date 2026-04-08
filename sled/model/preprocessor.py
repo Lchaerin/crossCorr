@@ -261,40 +261,41 @@ class AudioPreprocessor(nn.Module):
 
         # ── HRTF cross-correlation heatmap ────────────────────────────────────
         if self.use_hrtf_corr:
-            # Computed ONCE per window using the time-averaged CSD spectrum.
-            # Output: [B, az_bins=64, el_bins=32]  — fixed-size az × el spatial map.
+            # Per-frame HRTF: compute correlation for EVERY STFT frame
+            # Output: [B, T_stft, az_bins=64, el_bins=32]
+            T_stft = csd_full.shape[-1]
 
-            # Sample 8 evenly spaced frames across the window and average → [B, F]
-            T_stft    = csd_full.shape[-1]
-            idx8      = torch.linspace(0, T_stft - 1, 8).long()
-            csd_r_avg = csd_full.real[..., idx8].mean(dim=-1)
-            csd_i_avg = csd_full.imag[..., idx8].mean(dim=-1)
-
-            # Per-direction correlation  [B, N_DIR]
+            # Per-direction correlation for all frames at once
+            # W_real: [N_DIR, F], csd_full.real: [B, F, T_stft]
+            # einsum → [B, N_DIR, T_stft]
             corr_unnorm = (
-                torch.einsum('df,bf->bd', self.W_real, csd_r_avg) -
-                torch.einsum('df,bf->bd', self.W_imag, csd_i_avg)
+                torch.einsum('df,bft->bdt', self.W_real, csd_full.real) -
+                torch.einsum('df,bft->bdt', self.W_imag, csd_full.imag)
             )
-            norm1_sq = torch.einsum('df,bf->bd', self.norm_hr_sq, pow_L[..., idx8].mean(dim=-1))
-            norm2_sq = torch.einsum('df,bf->bd', self.norm_hl_sq, pow_R[..., idx8].mean(dim=-1))
-            corr = corr_unnorm / (norm1_sq * norm2_sq + 1e-8).sqrt()   # [B, N_DIR]
+            # Normalisation per frame
+            norm1_sq = torch.einsum('df,bft->bdt', self.norm_hr_sq, pow_L)  # [B, N_DIR, T_stft]
+            norm2_sq = torch.einsum('df,bft->bdt', self.norm_hl_sq, pow_R)
+            corr = corr_unnorm / (norm1_sq * norm2_sq + 1e-8).sqrt()        # [B, N_DIR, T_stft]
 
-            # Build 2D az × el grid  [B, az_bins=64, el_bins=32]
+            # Build 2D az × el grid per frame [B, T_stft, az_bins, el_bins]
             az_bins = self.n_mels    # 64
-            el_bins = 32             # fixed: ~5.6° per bin
+            el_bins = 32
 
-            el_bin_float = (self.elevations + 90.0) / 180.0 * el_bins  # [N_DIR]
-            el_bin_idx   = el_bin_float.long().clamp(0, el_bins - 1)   # [N_DIR]
+            el_bin_float = (self.elevations + 90.0) / 180.0 * el_bins
+            el_bin_idx   = el_bin_float.long().clamp(0, el_bins - 1)
+            flat_idx     = self.az_bin_idx * el_bins + el_bin_idx              # [N_DIR]
 
-            flat_idx   = self.az_bin_idx * el_bins + el_bin_idx         # [N_DIR]
-            flat_idx_b = flat_idx.view(1, -1).expand(B, -1)             # [B, N_DIR]
+            # Transpose corr to [B*T, N_DIR] for scatter
+            corr_t     = corr.permute(0, 2, 1).reshape(B * T_stft, -1)        # [B*T, N_DIR]
+            flat_idx_t = flat_idx.view(1, -1).expand(B * T_stft, -1)          # [B*T, N_DIR]
 
-            hrtf_flat  = corr.new_zeros(B, az_bins * el_bins)
-            count_flat = corr.new_zeros(B, az_bins * el_bins)
-            hrtf_flat.scatter_add_(1, flat_idx_b, corr)
-            count_flat.scatter_add_(1, flat_idx_b, torch.ones_like(corr))
+            hrtf_flat  = corr_t.new_zeros(B * T_stft, az_bins * el_bins)
+            count_flat = corr_t.new_zeros(B * T_stft, az_bins * el_bins)
+            hrtf_flat.scatter_add_(1, flat_idx_t, corr_t)
+            count_flat.scatter_add_(1, flat_idx_t, torch.ones_like(corr_t))
 
-            ch5 = (hrtf_flat / (count_flat + 1e-8)).view(B, az_bins, el_bins)
+            ch5 = (hrtf_flat / (count_flat + 1e-8)).view(B, T_stft, az_bins, el_bins)
+            # ch5 shape: [B, T_stft, 64, 32]  (was [B, 64, 32])
         else:
             ch5 = None
 

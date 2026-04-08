@@ -30,7 +30,7 @@ Components
       After each layer predicts a rough DOA unit vector from matching queries
       and injects it as a learned positional embedding into the next layer,
       giving true iterative geometric refinement.
-      Now accepts both freq_memory (7 tokens) and spatial_memory (72 tokens).
+      Now accepts both freq_memory (11 tokens) and spatial_memory (72 tokens).
 """
 
 import math
@@ -61,8 +61,18 @@ class CrossAttentionQuerySelector(nn.Module):
         super().__init__()
         self.n_slots = n_slots
 
-        # Learnable slot content queries [n_slots, d_model]
-        self.slot_queries = nn.Parameter(
+        # Learnable slot content queries with spatial prior
+        # For n_slots=3 → 0°, 120°, 240° initial bias
+        slot_init = torch.randn(n_slots, d_model) * 0.02
+        for s in range(n_slots):
+            angle = 2 * math.pi * s / n_slots
+            slot_init[s, 0] += 0.5 * math.cos(angle)
+            slot_init[s, 1] += 0.5 * math.sin(angle)
+            slot_init[s, 2] += 0.0  # elevation neutral
+        self.slot_queries = nn.Parameter(slot_init)
+
+        # Slot-specific spatial embedding (learnable, added after cross-attn)
+        self.slot_spatial_embed = nn.Parameter(
             torch.randn(n_slots, d_model) * 0.02
         )
 
@@ -98,7 +108,11 @@ class CrossAttentionQuerySelector(nn.Module):
         q = self.slot_queries.unsqueeze(0).expand(B * T, -1, -1)  # [B*T, S, d]
 
         attn_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
-        q = self.norm1(q + attn_out)   # residual + norm
+        q = self.norm1(q + attn_out)
+
+        # Add slot-specific spatial embedding to encourage diversity
+        spatial_emb = self.slot_spatial_embed.unsqueeze(0).expand(B * T, -1, -1)
+        q = q + spatial_emb
 
         q = self.norm2(q + self.ffn(q))
         return q   # [B*T, n_slots, d]
@@ -301,7 +315,7 @@ class SlotCompetitionLayer(nn.Module):
     Processing order (post-norm):
       1. self-attn          — inter-slot competition; slots influence each other
       2. spatial cross-attn — Q=slots, KV=spatial_memory (72 direction tokens)
-      3. freq cross-attn    — Q=slots, KV=freq_memory   (7 scale tokens)
+      3. freq cross-attn    — Q=slots, KV=freq_memory   (11 scale tokens)
       4. FFN
 
     The explicit inter-slot self-attention forces diversity: once one slot
@@ -353,7 +367,7 @@ class SlotCompetitionLayer(nn.Module):
         Parameters
         ----------
         slots          : [B*T, S_total, d]
-        freq_memory    : [B*T, 7, d]
+        freq_memory    : [B*T, 11, d]
         spatial_memory : [B*T, n_dirs, d]
         self_attn_mask : [S_total, S_total] or None
 
@@ -446,7 +460,7 @@ class IterativeRefinementDecoder(nn.Module):
         Parameters
         ----------
         queries        : [B*T, S_total, d]   initial queries (matching + optional DN)
-        freq_memory    : [B*T, 7, d]         encoder multi-scale memory
+        freq_memory    : [B*T, 11, d]        encoder multi-scale memory
         spatial_memory : [B*T, n_dirs, d]    direction-aware spatial memory
         attn_mask      : [S_total, S_total]  or None
 

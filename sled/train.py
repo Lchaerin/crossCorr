@@ -312,7 +312,7 @@ def compute_losses(layer_preds: list, gt: dict,
     # T-alignment guard
     T_d   = min(doa_last.shape[1], mask_div.shape[1])
     div   = _diversity_loss_fn(doa_last[:, :T_d], mask_div[:, :T_d])
-    total_loss = total_loss + 0.5 * div
+    total_loss = total_loss + 1.0 * div
 
     return total_loss
 
