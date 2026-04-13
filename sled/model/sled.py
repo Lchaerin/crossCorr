@@ -28,6 +28,7 @@ from .decoder      import (
     SpatialBeamformingMemory,
 )
 from .heads        import DetectionHeads
+from .nms          import batch_doa_nms
 
 
 class SLEDv3(nn.Module):
@@ -37,8 +38,9 @@ class SLEDv3(nn.Module):
     ----------
     sofa_path           : path to SOFA HRTF file
     d_model             : feature dimension (256)
-    n_slots             : maximum simultaneous sources per frame (3)
+    n_slots             : over-provisioned slots per frame (12)
     n_classes           : real sound classes only, no empty class (e.g. 209)
+    max_sources         : GT maximum simultaneous sources; NMS output cap (3)
     n_decoder_layers    : number of IterativeRefinement decoder layers (4)
     n_conformer_layers  : number of CausalConformerBlocks in encoder (6)
     precompute_features : if True, skip preprocessor (input must be [B,5,64,T])
@@ -50,7 +52,8 @@ class SLEDv3(nn.Module):
     N_CANDIDATES = 11   # 10 sub-band + 1 enc_out
 
     def __init__(self, sofa_path: str, d_model: int = 256,
-                 n_slots: int = 3, n_classes: int = 209,
+                 n_slots: int = 12, n_classes: int = 209,
+                 max_sources: int = 3,
                  n_decoder_layers: int = 4, n_conformer_layers: int = 6,
                  precompute_features: bool = False,
                  use_hrtf_corr: bool = True,
@@ -59,6 +62,7 @@ class SLEDv3(nn.Module):
         super().__init__()
 
         self.n_slots             = n_slots
+        self.max_sources         = max_sources
         self.n_classes           = n_classes
         self.precompute_features = precompute_features
         self.use_hrtf_corr       = use_hrtf_corr
@@ -201,6 +205,19 @@ class SLEDv3(nn.Module):
             layer_preds.append(self.heads(match_out, B, T))
 
         result = {'layer_preds': layer_preds}
+
+        # ── NMS (inference only) ──────────────────────────────────────────────
+        if gt is None and not self.training:
+            last_pred = layer_preds[-1]
+            nms_indices = batch_doa_nms(
+                class_logits = last_pred['class_logits'],
+                doa_vecs     = last_pred['doa_vec'],
+                confidences  = last_pred['confidence'],
+                cos_thresh   = 0.9,
+                conf_thresh  = 0.5,
+                max_sources  = self.max_sources,
+            )
+            result['nms_indices'] = nms_indices
 
         # ── DN heads ─────────────────────────────────────────────────────────
         if gt is not None and self.training and S_dn > 0:

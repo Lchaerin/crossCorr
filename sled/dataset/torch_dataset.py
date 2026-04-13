@@ -54,6 +54,7 @@ class SLEDDataset(Dataset):
         self.window_frames   = window_frames
         self.augment_scs     = augment_scs and (split == 'train')
         self.min_loudness_db = min_loudness_db
+        self._max_sources    = self.MAX_SLOTS   # default: no restriction
 
         # Load split metadata
         split_meta_path = os.path.join(dataset_root, 'meta', 'split.json')
@@ -86,6 +87,15 @@ class SLEDDataset(Dataset):
             )
 
     # ─────────────────────────────────────────────────────────────────────────
+
+    def set_max_sources(self, max_sources: int) -> None:
+        """커리큘럼 학습용: 이 epoch에서 사용할 최대 활성 음원 수 제한.
+
+        max_sources=1이면 프레임당 1개만 남기고 나머지 마스크 제거.
+        max_sources=2이면 최대 2개 유지.
+        max_sources=3(기본)이면 제한 없음.
+        """
+        self._max_sources = max(1, int(max_sources))
 
     def __len__(self) -> int:
         return len(self.scene_ids)
@@ -141,6 +151,17 @@ class SLEDDataset(Dataset):
         mask_w    = mask_w & ~too_quiet
         cls_w     = cls_w.copy()
         cls_w[too_quiet] = -1   # sentinel: inactive
+
+        # Curriculum: if _max_sources < MAX_SLOTS, randomly suppress extras.
+        if self._max_sources < self.MAX_SLOTS:
+            for t in range(mask_w.shape[0]):
+                active_idx = np.where(mask_w[t])[0]
+                if len(active_idx) > self._max_sources:
+                    n_suppress = len(active_idx) - self._max_sources
+                    suppress = np.random.choice(active_idx, n_suppress,
+                                                replace=False)
+                    mask_w[t, suppress] = False
+                    cls_w[t, suppress]  = -1
 
         # Slice audio
         s_start = t_start * self.HOP_SAMPLES

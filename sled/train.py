@@ -109,15 +109,16 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
       - Presence loss  : BCE on all slots (1 = matched, 0 = unmatched/inactive)
       - Count loss     : L1 between Σ sigmoid(conf) and GT active count
     """
-    class_logits = pred['class_logits']   # [B, T, S, C]
-    doa_vec      = pred['doa_vec']        # [B, T, S, 3]
-    confidence   = pred['confidence']     # [B, T, S]
+    class_logits = pred['class_logits']   # [B, T, S_pred, C]
+    doa_vec      = pred['doa_vec']        # [B, T, S_pred, 3]
+    confidence   = pred['confidence']     # [B, T, S_pred]
 
-    gt_cls  = gt['cls']    # [B, T, S]   int64
-    gt_doa  = gt['doa']    # [B, T, S, 3]
-    gt_mask = gt['mask']   # [B, T, S]   bool
+    gt_cls  = gt['cls']    # [B, T, S_gt]  int64
+    gt_doa  = gt['doa']    # [B, T, S_gt, 3]
+    gt_mask = gt['mask']   # [B, T, S_gt]  bool
 
-    B, T, S, C = class_logits.shape
+    B, T, S_pred, C = class_logits.shape
+    S_gt = gt_cls.shape[2]   # max_sources (e.g. 3)
     T_gt = gt_cls.shape[1]
     if T != T_gt:
         T = min(T, T_gt)
@@ -132,42 +133,43 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
     device = class_logits.device
 
     # ── Flatten batch × time ──────────────────────────────────────────────────
-    logits_flat = class_logits.reshape(BT, S, C)   # [BT, S, C]
-    doa_flat    = doa_vec.reshape(BT, S, 3)        # [BT, S, 3]
-    conf_flat   = confidence.reshape(BT, S)        # [BT, S]
-    cls_gt_flat = gt_cls.reshape(BT, S)            # [BT, S]
-    doa_gt_flat = gt_doa.reshape(BT, S, 3)         # [BT, S, 3]
-    mask_flat   = gt_mask.reshape(BT, S)           # [BT, S] bool
+    logits_flat = class_logits.reshape(BT, S_pred, C)    # [BT, S_pred, C]
+    doa_flat    = doa_vec.reshape(BT, S_pred, 3)         # [BT, S_pred, 3]
+    conf_flat   = confidence.reshape(BT, S_pred)         # [BT, S_pred]
+    cls_gt_flat = gt_cls.reshape(BT, S_gt)               # [BT, S_gt]
+    doa_gt_flat = gt_doa.reshape(BT, S_gt, 3)            # [BT, S_gt, 3]
+    mask_flat   = gt_mask.reshape(BT, S_gt)              # [BT, S_gt] bool
 
-    # ── Build all [BT, S, S] cost matrices on GPU in one pass ─────────────────
+    # ── Build all [BT, S_pred, S_gt] cost matrices on GPU in one pass ─────────
     # cls_cost ∈ [-1, 0]  (negative probability)
     # doa_cost ∈ [0, 2]   (1 − cosine similarity)
     # Scale doa by 0.5 so both terms have comparable magnitude ∈ [0, 1].
     with torch.no_grad():
-        prob = logits_flat.softmax(-1)                            # [BT, S, C]
+        prob = logits_flat.softmax(-1)                                         # [BT, S_pred, C]
 
         # cls_cost[bt, i, j] = -prob[bt, i, cls_gt[bt, j]]
         # Clamp to [0, C-1]: inactive slots carry class=n_classes (=C),
         # which is out of range for gather. The clamped cost is a dummy —
         # inactive columns are excluded via active_cols = np.where(mask_np[bt]).
-        cls_gt_exp = cls_gt_flat.clamp(0, C - 1).unsqueeze(1).expand(BT, S, S)
-        cls_cost   = -prob.gather(2, cls_gt_exp)                  # [BT, S, S]
+        cls_gt_exp = cls_gt_flat.clamp(0, C - 1).unsqueeze(1).expand(BT, S_pred, S_gt)
+        cls_cost   = -prob.gather(2, cls_gt_exp)                               # [BT, S_pred, S_gt]
 
         # doa_cost[bt, i, j] = 1 - cos_sim(pred_doa[bt,i], gt_doa[bt,j])
-        pred_norm = F.normalize(doa_flat,    dim=-1)              # [BT, S, 3]
-        gt_norm   = F.normalize(doa_gt_flat, dim=-1)              # [BT, S, 3]
-        doa_cost  = 1.0 - torch.bmm(pred_norm, gt_norm.transpose(1, 2))  # [BT, S, S]
+        pred_norm = F.normalize(doa_flat,    dim=-1)                           # [BT, S_pred, 3]
+        gt_norm   = F.normalize(doa_gt_flat, dim=-1)                           # [BT, S_gt, 3]
+        doa_cost  = 1.0 - torch.bmm(pred_norm, gt_norm.transpose(1, 2))       # [BT, S_pred, S_gt]
 
         # ONE GPU→CPU transfer for all cost matrices + mask
-        cost_np = (cls_cost + 0.5 * doa_cost).cpu().numpy()   # [BT, S, S]
-        mask_np = mask_flat.cpu().numpy()                      # [BT, S] bool
+        cost_np = (cls_cost + 0.5 * doa_cost).cpu().numpy()   # [BT, S_pred, S_gt]
+        mask_np = mask_flat.cpu().numpy()                      # [BT, S_gt] bool
 
     # ── Hungarian matching — pure CPU, zero GPU ops inside ────────────────────
-    # Use actual active-column indices (not :n_act slice) so that col_arr always
-    # refers to valid GT slots even when active slots are not contiguous.
-    bt_arr  = np.empty(BT * S, dtype=np.int64)
-    row_arr = np.empty(BT * S, dtype=np.int64)
-    col_arr = np.empty(BT * S, dtype=np.int64)
+    # linear_sum_assignment supports rectangular cost matrices (S_pred × n_active).
+    # Maximum matches = BT * S_gt (at most one GT per frame).
+    max_matches = BT * S_gt
+    bt_arr  = np.empty(max_matches, dtype=np.int64)
+    row_arr = np.empty(max_matches, dtype=np.int64)
+    col_arr = np.empty(max_matches, dtype=np.int64)
     n_matched = 0
 
     for bt in range(BT):
@@ -183,7 +185,7 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
         n_matched += m
 
     # ── Vectorised loss computation — ONE upload, batch GPU ops ───────────────
-    conf_tgt = torch.zeros(BT, S, device=device)
+    conf_tgt = torch.zeros(BT, S_pred, device=device)   # [BT, S_pred]
 
     if n_matched > 0:
         bt_idx  = torch.from_numpy(bt_arr [:n_matched]).to(device)
@@ -203,7 +205,16 @@ def _compute_single_layer_loss(pred: dict, gt: dict) -> torch.Tensor:
         cls_loss = torch.tensor(0.0, device=device)
         doa_loss = torch.tensor(0.0, device=device)
 
-    presence_loss = F.binary_cross_entropy_with_logits(conf_flat, conf_tgt)
+    # Positive weight to counteract S_pred:S_gt imbalance (e.g. 12:3 → ~3.0)
+    n_positive = conf_tgt.sum().clamp(min=1)
+    n_total    = conf_tgt.numel()
+    pos_weight = torch.tensor(
+        [(n_total - n_positive) / n_positive],
+        device=device,
+    ).clamp(max=10.0)
+    presence_loss = F.binary_cross_entropy_with_logits(
+        conf_flat, conf_tgt, pos_weight=pos_weight
+    )
 
     # DOA weight 2× relative to classification
     return cls_loss + 2.0 * doa_loss + presence_loss
@@ -302,12 +313,14 @@ def compute_losses(layer_preds: list, gt: dict,
             )
             total_loss = total_loss + w * 0.5 * (dn_loss + neg_conf_loss)
 
-    # ── Slot diversity loss on the last layer (λ=0.5) ─────────────────────────
+    # ── Slot diversity loss on the last layer ────────────────────────────────
     # Penalises active slots predicting similar DOA directions.
     # Applied once (last layer) to avoid over-regularising early layers.
+    # Use predicted confidence as activity mask so shapes match S_pred (≠ S_gt).
     last_pred = layer_preds[-1]
-    doa_last  = last_pred['doa_vec']          # [B, T, S, 3]
-    mask_div  = gt['mask']                    # [B, T, S] bool
+    doa_last  = last_pred['doa_vec']                          # [B, T, S_pred, 3]
+    conf_div  = last_pred['confidence']                       # [B, T, S_pred]
+    mask_div  = torch.sigmoid(conf_div.detach()) > 0.5       # [B, T, S_pred] bool
 
     # T-alignment guard
     T_d   = min(doa_last.shape[1], mask_div.shape[1])
@@ -315,6 +328,23 @@ def compute_losses(layer_preds: list, gt: dict,
     total_loss = total_loss + 1.0 * div
 
     return total_loss
+
+
+# =============================================================================
+# Curriculum helper
+# =============================================================================
+
+def _set_max_sources(loader, max_sources: int) -> None:
+    """커리큘럼 학습: DataLoader의 기반 SLEDDataset(들)에 max_sources 전달."""
+    from torch.utils.data import ConcatDataset
+
+    dataset = loader.dataset
+    if hasattr(dataset, 'set_max_sources'):
+        dataset.set_max_sources(max_sources)
+    elif isinstance(dataset, ConcatDataset):
+        for ds in dataset.datasets:
+            if hasattr(ds, 'set_max_sources'):
+                ds.set_max_sources(max_sources)
 
 
 # =============================================================================
@@ -562,14 +592,26 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
 
-        # Curriculum: adjust n_dn_groups
-        # Phase 1 (1–30):  5 DN groups
-        # Phase 2 (31–80): 3 DN groups
-        # Phase 3 (81+):   3 DN groups
-        if epoch <= 30:
+        # ── Curriculum: source count + DN groups ──────────────────────────────
+        # Phase 1 (1-40):   단일 음원 위주, DN 5 groups
+        # Phase 2 (41-80):  1~2 음원 혼합, DN 3 groups
+        # Phase 3 (81-150): 1~3 음원 혼합, DN 3 groups
+        # Phase 4 (151+):   다중 음원 비율 높임, DN 3 groups
+        if epoch <= 40:
             model.denoising.n_dn_groups = 5
+            max_sources_curriculum = 1
+        elif epoch <= 80:
+            model.denoising.n_dn_groups = 3
+            max_sources_curriculum = 2
+        elif epoch <= 150:
+            model.denoising.n_dn_groups = 3
+            max_sources_curriculum = 3
         else:
             model.denoising.n_dn_groups = 3
+            max_sources_curriculum = 3
+
+        # DataLoader에 현재 phase의 max_sources 전달
+        _set_max_sources(train_loader, max_sources_curriculum)
 
         t_start = time.time()
         train_loss, global_step = train_one_epoch(
