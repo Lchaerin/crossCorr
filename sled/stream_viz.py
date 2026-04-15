@@ -169,6 +169,10 @@ class AudioRingBuffer:
 class PredictionStore:
     """최신 추론 결과 + 궤적 기록 보관소."""
 
+    # EMA 계수: 클수록 새 값 반영 빠름 (DOA 스무딩 / conf 스무딩)
+    DOA_ALPHA  = 0.35   # 낮출수록 DOA가 더 부드러워짐
+    CONF_ALPHA = 0.45   # 낮출수록 conf 변화가 더 완만해짐
+
     def __init__(self, n_slots: int = 3, trail_len: int = TRAIL_LEN):
         self.trail_len = trail_len
         self._lock     = threading.Lock()
@@ -177,6 +181,10 @@ class PredictionStore:
         self.doa  = np.zeros((n_slots, 3), dtype=np.float32)
         self.doa[:, 0] = 1.0   # 초기: 정면
         self.conf = np.zeros(n_slots, dtype=np.float32)
+        # EMA 상태 (슬롯 트래킹용)
+        self._ema_doa  = self.doa.copy()   # [n_slots, 3] 단위벡터
+        self._ema_conf = self.conf.copy()  # [n_slots]
+        self._ema_cls  = self.cls.copy()   # [n_slots] int
         # 궤적 (deque of dicts)
         self.trail: collections.deque = collections.deque(maxlen=trail_len)
         # 메트릭
@@ -186,14 +194,58 @@ class PredictionStore:
 
     def update(self, cls, doa, conf, infer_ms: float):
         with self._lock:
-            self.cls       = cls.copy()
-            self.doa       = doa.copy()
-            self.conf      = conf.copy()
+            n = len(conf)
+            # ── 슬롯 트래킹: 새 예측을 기존 EMA 슬롯에 코사인 유사도로 매칭 ──
+            cos_sim = doa @ self._ema_doa.T          # [n_new, n_slots]
+            # conf 가중 유사도: 활성 슬롯 위주로 매칭
+            weighted = cos_sim * (self._ema_conf[None, :] + 1e-3)
+            new_to_old = np.full(n, -1, dtype=np.int32)
+            used_old   = set()
+            for _ in range(n):
+                idx = np.unravel_index(np.argmax(weighted), weighted.shape)
+                ni, oi = idx
+                if weighted[ni, oi] < 0:
+                    break
+                new_to_old[ni] = oi
+                used_old.add(oi)
+                weighted[ni, :] = -1
+                weighted[:, oi] = -1
+
+            # ── EMA 업데이트 ──────────────────────────────────────────────────
+            new_ema_doa  = self._ema_doa.copy()
+            new_ema_conf = self._ema_conf.copy()
+            new_ema_cls  = self._ema_cls.copy()
+            for ni in range(n):
+                oi = new_to_old[ni]
+                if oi < 0:
+                    continue
+                # DOA: 구면 NLERP (정규화된 선형 보간)
+                blended = (1 - self.DOA_ALPHA) * self._ema_doa[oi] + self.DOA_ALPHA * doa[ni]
+                norm    = np.linalg.norm(blended)
+                new_ema_doa[oi]  = blended / norm if norm > 1e-6 else doa[ni]
+                # conf: EMA
+                new_ema_conf[oi] = (1 - self.CONF_ALPHA) * self._ema_conf[oi] + self.CONF_ALPHA * conf[ni]
+                # cls: 새 값으로 업데이트 (EMA 불필요)
+                new_ema_cls[oi]  = cls[ni]
+            # 매칭 안 된 기존 슬롯은 conf를 빠르게 감쇠
+            for oi in range(n):
+                if oi not in used_old:
+                    new_ema_conf[oi] *= 0.5
+
+            self._ema_doa  = new_ema_doa
+            self._ema_conf = new_ema_conf
+            self._ema_cls  = new_ema_cls
+
+            # 외부에 노출하는 값은 EMA 기준 슬롯 순서로
+            self.cls  = self._ema_cls.copy()
+            self.doa  = self._ema_doa.copy()
+            self.conf = self._ema_conf.copy()
+
             self.infer_ms  = infer_ms
             self.infer_time = time.time()
             self.trail.append({
-                'doa' : doa.copy(),
-                'conf': conf.copy(),
+                'doa' : self.doa.copy(),
+                'conf': self.conf.copy(),
             })
             self.ready = True
 
@@ -246,6 +298,18 @@ def inference_worker(
             cls  = pred['class_logits'][0, t_last].argmax(-1).cpu().numpy()
             doa  = pred['doa_vec'][0, t_last].cpu().numpy()
             conf = torch.sigmoid(pred['confidence'][0, t_last]).cpu().numpy()
+
+            # conf 임계값 이상인 슬롯만 후보로 두고, 최대 3개 선택
+            CONF_MIN = 0.50   # 이 값 미만 슬롯은 노이즈로 간주하여 제거
+            sorted_idx = np.argsort(conf)[::-1]
+            top_idx = [i for i in sorted_idx if conf[i] >= CONF_MIN][:3]
+            if len(top_idx) == 0:
+                # 임계 이상인 슬롯이 없으면 가장 높은 것 하나만
+                top_idx = [sorted_idx[0]]
+            top_idx = np.array(top_idx)
+            cls  = cls[top_idx]
+            doa  = doa[top_idx]
+            conf = conf[top_idx]
 
             infer_ms = (time.perf_counter() - t0) * 1000
             pred_store.update(cls, doa, conf, infer_ms)
@@ -457,7 +521,7 @@ class RealtimeViz:
 
         # 범례
         legend_elems = [
-            mpatches.Patch(facecolor=_SLOT_COLORS[i],
+            mpatches.Patch(facecolor=_SLOT_COLORS[i % len(_SLOT_COLORS)],
                            label=f'Slot {i+1}', edgecolor='white', linewidth=0.5)
             for i in range(n_slots)
         ]
